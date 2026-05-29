@@ -65,6 +65,8 @@ async function initSqlite(dbPath?: string): Promise<void> {
 async function initMongo(): Promise<void> {
   mongoExports = await import('./mongo/index.js');
   await mongoExports.connectMongo(MONGODB_URI);
+  const { initEncryptionKeyMongo } = await import('../lib/crypto.js');
+  await initEncryptionKeyMongo();
   console.log(`MongoDB initialized at ${MONGODB_URI.replace(/\/\/[^:]+:[^@]+@/, '//***:***@')}`);
 }
 

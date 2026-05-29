@@ -100,7 +100,14 @@ async function seedIfEmpty(database: Db): Promise<void> {
   if (modelCount > 0) return;
 
   const models = getSeedModels();
-  await database.collection('models').insertMany(models);
+  const seen = new Set<string>();
+  const unique = models.filter(m => {
+    const key = `${m.platform}:${m.model_id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  await database.collection('models').insertMany(unique, { ordered: false });
 
   // Fallback config
   const allModels = await database.collection('models').find().sort({ intelligence_rank: 1 }).toArray();

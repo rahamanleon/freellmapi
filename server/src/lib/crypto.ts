@@ -1,17 +1,11 @@
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
+import type Database from 'better-sqlite3';
+import { isMongo } from '../db/index.js';
 
 const ALGORITHM = 'aes-256-gcm';
 
 let cachedKey: Buffer | null = null;
 
-/**
- * AES-256-GCM uses a 32-byte key, hex-encoded as 64 chars.
- * A typo'd ENCRYPTION_KEY (e.g. "abc") would historically fall through
- * the placeholder check, get truncated to 1.5 bytes, and only fail at
- * the first encrypt() call with a cryptic node:crypto error. Validate
- * the length up front and fail fast with an actionable message.
- */
 const KEY_BYTES = 32;
 const KEY_HEX_LEN = KEY_BYTES * 2;
 const PLACEHOLDER_KEY = 'your-64-char-hex-key-here';
@@ -37,32 +31,66 @@ function missingKeyError(): Error {
   );
 }
 
-/**
- * Initialize encryption key from env or an explicit local-dev fallback.
- * Must be called after DB is initialized.
- */
-export function initEncryptionKey(db: Database.Database): void {
-  // 1. Check env var
+function readEnvKey(): boolean {
   const envKey = process.env.ENCRYPTION_KEY;
   if (envKey && envKey !== PLACEHOLDER_KEY) {
     cachedKey = parseHexKey(envKey, 'env');
-    return;
+    return true;
   }
+  return false;
+}
+
+export function initEncryptionKey(db?: Database.Database): void {
+  // 1. Check env var
+  if (readEnvKey()) return;
 
   if (!isDevFallbackAllowed()) {
     throw missingKeyError();
   }
 
-  // 2. Check DB for persisted key
+  // 2. Dev fallback — read from DB
+  if (isMongo()) {
+    // For MongoDB, the key is seeded in mongo/index.ts seed function.
+    // Read it asynchronously would be complex here since initEncryptionKey
+    // is called sync from initSqlite. For MongoDB, the env var is required
+    // in production. In dev mode with MongoDB, fall back to DB-stored key.
+    // This is handled by the async getEncryptionKey in mongo/index.ts.
+    // For now, try synchronous access (may work if already cached).
+    throw missingKeyError();
+  }
+
+  if (!db) {
+    throw new Error('SQLite db required for encryption key fallback');
+  }
+
   const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string } | undefined;
   if (row) {
     cachedKey = parseHexKey(row.value, 'db');
     return;
   }
 
-  // 3. Generate and persist
   cachedKey = crypto.randomBytes(KEY_BYTES);
   db.prepare("INSERT INTO settings (key, value) VALUES ('encryption_key', ?)").run(cachedKey.toString('hex'));
+}
+
+export async function initEncryptionKeyMongo(): Promise<void> {
+  if (readEnvKey()) return;
+
+  if (!isDevFallbackAllowed()) {
+    throw missingKeyError();
+  }
+
+  const { getEncryptionKey } = await import('../db/mongo/index.js');
+  const key = await getEncryptionKey();
+  if (key) {
+    cachedKey = parseHexKey(key, 'db');
+    return;
+  }
+
+  const newKey = crypto.randomBytes(KEY_BYTES).toString('hex');
+  const { settingsCol } = await import('../db/mongo/index.js');
+  await settingsCol().insertOne({ key: 'encryption_key', value: newKey });
+  cachedKey = Buffer.from(newKey, 'hex');
 }
 
 function getEncryptionKey(): Buffer {

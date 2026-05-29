@@ -1,8 +1,14 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
+import { ObjectId } from 'mongodb';
 import { z } from 'zod';
 import { getDb, isMongo, getModelsCollection, getApiKeysCollection, getFallbackConfigCollection, getRequestsCollection } from '../db/index.js';
 import { getAllPenalties } from '../services/router.js';
+
+function toObjectId(id: string): any {
+  if (/^[0-9a-fA-F]{24}$/.test(id)) return new ObjectId(id);
+  return id;
+}
 
 export const fallbackRouter = Router();
 
@@ -17,7 +23,7 @@ fallbackRouter.get('/', async (_req: Request, res: Response) => {
 
     const fallbacks = await fcCol.find().sort({ priority: 1 }).toArray();
     rows = await Promise.all(fallbacks.map(async (fc: any) => {
-      const model = await modelsCol.findOne({ _id: fc.model_db_id as any });
+      const model = await modelsCol.findOne({ _id: toObjectId(fc.model_db_id) });
       if (!model) return null;
       return {
         model_db_id: fc.model_db_id,
@@ -182,7 +188,7 @@ fallbackRouter.get('/token-usage', async (_req: Request, res: Response) => {
     const fallbacks = await fcCol.find().sort({ priority: 1 }).toArray();
     models = [];
     for (const fb of fallbacks) {
-      const model = await modelsCol.findOne({ _id: fb.model_db_id as any, enabled: 1 });
+      const model = await modelsCol.findOne({ _id: toObjectId(fb.model_db_id), enabled: 1 });
       if (model) {
         models.push({ platform: model.platform, model_id: model.model_id, display_name: model.display_name, monthly_token_budget: model.monthly_token_budget, priority: fb.priority });
       }

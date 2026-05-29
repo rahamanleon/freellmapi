@@ -1,3 +1,4 @@
+import { ObjectId } from 'mongodb';
 import { getDb, isMongo, getModelsCollection, getApiKeysCollection, getFallbackConfigCollection } from '../db/index.js';
 import { getProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
@@ -109,7 +110,13 @@ async function getFallbackChainMongo(): Promise<FallbackRow[]> {
 
 async function getModelMongo(modelDbId: string): Promise<ModelRow | null> {
   const col = getModelsCollection();
-  const doc = await col.findOne({ _id: modelDbId as any });
+  let filter: any;
+  if (/^[0-9a-fA-F]{24}$/.test(modelDbId)) {
+    filter = { _id: new ObjectId(modelDbId) };
+  } else {
+    filter = { _id: modelDbId as any };
+  }
+  const doc = await col.findOne(filter);
   if (!doc || !doc.enabled) return null;
   return {
     id: String(doc._id),

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: freellmapi
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: PORT
+        value: 10000

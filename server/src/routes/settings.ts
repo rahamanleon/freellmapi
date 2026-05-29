@@ -4,13 +4,11 @@ import { getUnifiedApiKey, regenerateUnifiedKey } from '../db/index.js';
 
 export const settingsRouter = Router();
 
-// Get the unified API key
-settingsRouter.get('/api-key', (_req: Request, res: Response) => {
-  res.json({ apiKey: getUnifiedApiKey() });
+settingsRouter.get('/api-key', async (_req: Request, res: Response) => {
+  res.json({ apiKey: await getUnifiedApiKey() });
 });
 
-// Regenerate the unified API key
-settingsRouter.post('/api-key/regenerate', (_req: Request, res: Response) => {
-  const newKey = regenerateUnifiedKey();
+settingsRouter.post('/api-key/regenerate', async (_req: Request, res: Response) => {
+  const newKey = await regenerateUnifiedKey();
   res.json({ apiKey: newKey });
 });

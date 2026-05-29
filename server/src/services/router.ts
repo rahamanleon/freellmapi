@@ -1,11 +1,11 @@
-import { getDb } from '../db/index.js';
+import { getDb, isMongo, getModelsCollection, getApiKeysCollection, getFallbackConfigCollection } from '../db/index.js';
 import { getProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown } from './ratelimit.js';
 import type { BaseProvider } from '../providers/base.js';
 
 interface ModelRow {
-  id: number;
+  id: string;
   platform: string;
   model_id: string;
   display_name: string;
@@ -16,7 +16,7 @@ interface ModelRow {
 }
 
 interface KeyRow {
-  id: number;
+  id: string;
   platform: string;
   encrypted_key: string;
   iv: string;
@@ -26,7 +26,7 @@ interface KeyRow {
 }
 
 interface FallbackRow {
-  model_db_id: number;
+  model_db_id: string;
   priority: number;
   enabled: number;
 }
@@ -34,30 +34,21 @@ interface FallbackRow {
 export interface RouteResult {
   provider: BaseProvider;
   modelId: string;
-  modelDbId: number;
+  modelDbId: string;
   apiKey: string;
-  keyId: number;
+  keyId: string;
   platform: string;
   displayName: string;
 }
 
-// Round-robin index per platform
 const roundRobinIndex = new Map<string, number>();
+const rateLimitPenalties = new Map<string, { count: number; lastHit: number; penalty: number }>();
+const PENALTY_PER_429 = 3;
+const MAX_PENALTY = 10;
+const DECAY_INTERVAL_MS = 2 * 60 * 1000;
+const DECAY_AMOUNT = 1;
 
-// ── Dynamic priority: track 429s per model and demote accordingly ──
-// Key: model_db_id → { count, lastHit, penalty }
-const rateLimitPenalties = new Map<number, { count: number; lastHit: number; penalty: number }>();
-
-// Penalty decays over time so models recover
-const PENALTY_PER_429 = 3;        // each 429 adds this many priority positions
-const MAX_PENALTY = 10;            // cap so a model doesn't sink forever
-const DECAY_INTERVAL_MS = 2 * 60 * 1000; // penalty decays every 2 minutes
-const DECAY_AMOUNT = 1;            // remove this much penalty per decay interval
-
-/**
- * Record a 429 for a model — increases its penalty so it sinks in priority.
- */
-export function recordRateLimitHit(modelDbId: number) {
+export function recordRateLimitHit(modelDbId: string) {
   const existing = rateLimitPenalties.get(modelDbId);
   const now = Date.now();
   if (existing) {
@@ -69,10 +60,7 @@ export function recordRateLimitHit(modelDbId: number) {
   }
 }
 
-/**
- * Record a success for a model — reduces its penalty so it rises back up.
- */
-export function recordSuccess(modelDbId: number) {
+export function recordSuccess(modelDbId: string) {
   const existing = rateLimitPenalties.get(modelDbId);
   if (existing) {
     existing.penalty = Math.max(0, existing.penalty - 1);
@@ -82,34 +70,25 @@ export function recordSuccess(modelDbId: number) {
   }
 }
 
-/**
- * Get the current penalty for a model (with time-based decay).
- */
-function getPenalty(modelDbId: number): number {
+function getPenalty(modelDbId: string): number {
   const entry = rateLimitPenalties.get(modelDbId);
   if (!entry) return 0;
-
-  // Apply time-based decay
   const now = Date.now();
   const elapsed = now - entry.lastHit;
   const decaySteps = Math.floor(elapsed / DECAY_INTERVAL_MS);
   if (decaySteps > 0) {
     entry.penalty = Math.max(0, entry.penalty - (decaySteps * DECAY_AMOUNT));
-    entry.lastHit = now; // reset so we don't double-decay
+    entry.lastHit = now;
     if (entry.penalty === 0) {
       rateLimitPenalties.delete(modelDbId);
       return 0;
     }
   }
-
   return entry.penalty;
 }
 
-/**
- * Get current penalties for all models (for the API/dashboard).
- */
-export function getAllPenalties(): Array<{ modelDbId: number; count: number; penalty: number }> {
-  const result: Array<{ modelDbId: number; count: number; penalty: number }> = [];
+export function getAllPenalties(): Array<{ modelDbId: string; count: number; penalty: number }> {
+  const result: Array<{ modelDbId: string; count: number; penalty: number }> = [];
   for (const [modelDbId, entry] of rateLimitPenalties) {
     const penalty = getPenalty(modelDbId);
     if (penalty > 0) {
@@ -119,35 +98,65 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
   return result.sort((a, b) => b.penalty - a.penalty);
 }
 
-/**
- * Route a request to the best available model.
- * Models are sorted by (base_priority + rate_limit_penalty) so frequently
- * rate-limited models automatically sink below working ones.
- *
- * If preferredModelDbId is set, that model gets tried FIRST (sticky sessions).
- * This prevents hallucination from model switching mid-conversation.
- *
- * @param estimatedTokens - estimated total tokens for rate limit check
- * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
- * @param preferredModelDbId - try this model first (sticky session)
- */
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number): RouteResult {
-  const db = getDb();
+async function getFallbackChainMongo(): Promise<FallbackRow[]> {
+  const col = getFallbackConfigCollection();
+  return col.find().sort({ priority: 1 }).map(doc => ({
+    model_db_id: String(doc.model_db_id),
+    priority: doc.priority,
+    enabled: doc.enabled,
+  })).toArray();
+}
 
-  // Get fallback chain ordered by priority
-  const fallbackChain = db.prepare(`
-    SELECT fc.model_db_id, fc.priority, fc.enabled
-    FROM fallback_config fc
-    ORDER BY fc.priority ASC
-  `).all() as FallbackRow[];
+async function getModelMongo(modelDbId: string): Promise<ModelRow | null> {
+  const col = getModelsCollection();
+  const doc = await col.findOne({ _id: modelDbId as any });
+  if (!doc || !doc.enabled) return null;
+  return {
+    id: String(doc._id),
+    platform: doc.platform,
+    model_id: doc.model_id,
+    display_name: doc.display_name,
+    rpm_limit: doc.rpm_limit ?? null,
+    rpd_limit: doc.rpd_limit ?? null,
+    tpm_limit: doc.tpm_limit ?? null,
+    tpd_limit: doc.tpd_limit ?? null,
+  };
+}
 
-  // Apply dynamic penalties: sort by (base priority + penalty)
+async function getKeysForPlatformMongo(platform: string): Promise<KeyRow[]> {
+  const col = getApiKeysCollection();
+  const docs = await col.find({ platform, enabled: 1, status: { $in: ['healthy', 'unknown'] } }).toArray();
+  return docs.map(d => ({
+    id: String(d._id),
+    platform: d.platform,
+    encrypted_key: d.encrypted_key,
+    iv: d.iv,
+    auth_tag: d.auth_tag,
+    status: d.status,
+    enabled: d.enabled,
+  }));
+}
+
+export async function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: string): Promise<RouteResult> {
+  let fallbackChain: FallbackRow[];
+
+  if (isMongo()) {
+    fallbackChain = await getFallbackChainMongo();
+  } else {
+    const db = getDb();
+    fallbackChain = db.prepare(`
+      SELECT fc.model_db_id, fc.priority, fc.enabled
+      FROM fallback_config fc
+      ORDER BY fc.priority ASC
+    `).all() as FallbackRow[];
+    fallbackChain = fallbackChain.map(f => ({ ...f, model_db_id: String(f.model_db_id) }));
+  }
+
   const sortedChain = fallbackChain.map(entry => ({
     ...entry,
     effectivePriority: entry.priority + getPenalty(entry.model_db_id),
   })).sort((a, b) => a.effectivePriority - b.effectivePriority);
 
-  // Sticky session: move preferred model to front of chain
   if (preferredModelDbId) {
     const idx = sortedChain.findIndex(e => e.model_db_id === preferredModelDbId);
     if (idx > 0) {
@@ -159,22 +168,49 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   for (const entry of sortedChain) {
     if (!entry.enabled) continue;
 
-    // Get model details
-    const model = db.prepare('SELECT * FROM models WHERE id = ? AND enabled = 1').get(entry.model_db_id) as ModelRow | undefined;
+    let model: ModelRow | null;
+    if (isMongo()) {
+      model = await getModelMongo(entry.model_db_id);
+    } else {
+      const db = getDb();
+      const row = db.prepare('SELECT * FROM models WHERE id = ? AND enabled = 1').get(parseInt(entry.model_db_id, 10)) as any;
+      if (!row) continue;
+      model = {
+        id: String(row.id),
+        platform: row.platform,
+        model_id: row.model_id,
+        display_name: row.display_name,
+        rpm_limit: row.rpm_limit,
+        rpd_limit: row.rpd_limit,
+        tpm_limit: row.tpm_limit,
+        tpd_limit: row.tpd_limit,
+      };
+    }
     if (!model) continue;
 
-    // Check if we have a provider for this platform
     const provider = getProvider(model.platform as any);
     if (!provider) continue;
 
-    // Get enabled keys that have not already failed validation or decryption.
-    const keys = db.prepare(
-      "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-    ).all(model.platform) as KeyRow[];
+    let keys: KeyRow[];
+    if (isMongo()) {
+      keys = await getKeysForPlatformMongo(model.platform);
+    } else {
+      const db = getDb();
+      keys = (db.prepare(
+        "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+      ).all(model.platform) as any[]).map((k: any) => ({
+        id: String(k.id),
+        platform: k.platform,
+        encrypted_key: k.encrypted_key,
+        iv: k.iv,
+        auth_tag: k.auth_tag,
+        status: k.status,
+        enabled: k.enabled,
+      }));
+    }
 
     if (keys.length === 0) continue;
 
-    // Get limits once for this model
     const limits = {
       rpm: model.rpm_limit,
       rpd: model.rpd_limit,
@@ -182,7 +218,6 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       tpd: model.tpd_limit,
     };
 
-    // Try all keys for this model before giving up on it
     const rrKey = `${model.platform}:${model.model_id}`;
     let idx = roundRobinIndex.get(rrKey) ?? 0;
 
@@ -193,22 +228,27 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       const skipId = `${model.platform}:${model.model_id}:${key.id}`;
       if (skipKeys?.has(skipId)) continue;
 
-      // Check cooldown (from previous 429s)
-      if (isOnCooldown(model.platform, model.model_id, key.id)) continue;
-
-      if (!canMakeRequest(model.platform, model.model_id, key.id, limits)) continue;
-      if (!canUseTokens(model.platform, model.model_id, key.id, estimatedTokens, limits)) continue;
+      if (await isOnCooldown(model.platform, model.model_id, key.id)) continue;
+      if (!(await canMakeRequest(model.platform, model.model_id, key.id, limits))) continue;
+      if (!(await canUseTokens(model.platform, model.model_id, key.id, estimatedTokens, limits))) continue;
 
       let decryptedKey: string;
       try {
         decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
       } catch {
-        db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
-          .run(key.id);
+        if (!isMongo()) {
+          const db = getDb();
+          db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
+            .run(parseInt(String(key.id), 10));
+        } else {
+          await getApiKeysCollection().updateOne(
+            { _id: key.id as any },
+            { $set: { status: 'error', last_checked_at: new Date().toISOString() } },
+          );
+        }
         continue;
       }
 
-      // We found a working key for this model!
       roundRobinIndex.set(rrKey, idx);
       return {
         provider,
@@ -221,13 +261,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       };
     }
 
-    // If we reach here, this specific model has NO available keys.
-    // Update round-robin index even if we failed so we don't get stuck.
     roundRobinIndex.set(rrKey, idx);
-    
-    // We don't explicitly penalize the model here because the fact that we 
-    // couldn't find a key means we will naturally move to the next model 
-    // in the `sortedChain` for THIS specific request.
   }
 
   const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as any;

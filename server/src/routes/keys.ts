@@ -1,14 +1,11 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { getDb } from '../db/index.js';
+import { getDb, isMongo, getApiKeysCollection } from '../db/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 
 export const keysRouter = Router();
 
-// Active providers — must match providers/index.ts registrations + shared/types.ts Platform.
-// Moonshot and MiniMax direct integrations were dropped in V4. HuggingFace
-// was dropped in V4 and re-added in V13 via the router.huggingface.co route.
 const PLATFORMS = [
   'google', 'groq', 'cerebras', 'sambanova', 'nvidia', 'mistral',
   'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
@@ -21,10 +18,15 @@ const addKeySchema = z.object({
   label: z.string().optional(),
 });
 
-// List all keys (masked)
-keysRouter.get('/', (_req: Request, res: Response) => {
-  const db = getDb();
-  const rows = db.prepare('SELECT * FROM api_keys ORDER BY created_at DESC').all() as any[];
+keysRouter.get('/', async (_req: Request, res: Response) => {
+  let rows: any[];
+  if (isMongo()) {
+    const col = getApiKeysCollection();
+    rows = await col.find().sort({ created_at: -1 }).toArray();
+  } else {
+    const db = getDb();
+    rows = db.prepare('SELECT * FROM api_keys ORDER BY created_at DESC').all() as any[];
+  }
 
   const keys = rows.map(row => {
     let maskedKey = '****';
@@ -35,12 +37,12 @@ keysRouter.get('/', (_req: Request, res: Response) => {
       maskedKey = '[decrypt failed]';
     }
     return {
-      id: row.id,
+      id: row.id ?? row._id?.toString(),
       platform: row.platform,
       label: row.label,
       maskedKey,
       status: row.status,
-      enabled: row.enabled === 1,
+      enabled: row.enabled === 1 || row.enabled === true,
       createdAt: row.created_at,
       lastCheckedAt: row.last_checked_at,
     };
@@ -49,8 +51,7 @@ keysRouter.get('/', (_req: Request, res: Response) => {
   res.json(keys);
 });
 
-// Add a key
-keysRouter.post('/', (req: Request, res: Response) => {
+keysRouter.post('/', async (req: Request, res: Response) => {
   const parsed = addKeySchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
@@ -60,34 +61,47 @@ keysRouter.post('/', (req: Request, res: Response) => {
   const { platform, key, label } = parsed.data;
   const { encrypted, iv, authTag } = encrypt(key);
 
-  const db = getDb();
-  const result = db.prepare(`
-    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-    VALUES (?, ?, ?, ?, ?, 'unknown', 1)
-  `).run(platform, label ?? '', encrypted, iv, authTag);
+  let id: any;
+  if (isMongo()) {
+    const col = getApiKeysCollection();
+    const result = await col.insertOne({
+      platform, label: label ?? '', encrypted_key: encrypted, iv, auth_tag: authTag,
+      status: 'unknown', enabled: 1, created_at: new Date().toISOString(), last_checked_at: null,
+    });
+    id = result.insertedId.toString();
+  } else {
+    const db = getDb();
+    const result = db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, 'unknown', 1)
+    `).run(platform, label ?? '', encrypted, iv, authTag);
+    id = result.lastInsertRowid;
+  }
 
   res.status(201).json({
-    id: result.lastInsertRowid,
-    platform,
-    label: label ?? '',
-    maskedKey: maskKey(key),
-    status: 'unknown',
-    enabled: true,
+    id, platform, label: label ?? '', maskedKey: maskKey(key), status: 'unknown', enabled: true,
   });
 });
 
-// Delete a key
-keysRouter.delete('/:id', (req: Request, res: Response) => {
+keysRouter.delete('/:id', async (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
   if (isNaN(id)) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
     return;
   }
 
-  const db = getDb();
-  const result = db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
+  let changes = 0;
+  if (isMongo()) {
+    const col = getApiKeysCollection();
+    const result = await col.deleteOne({ _id: id as any });
+    changes = result.deletedCount;
+  } else {
+    const db = getDb();
+    const result = db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
+    changes = result.changes;
+  }
 
-  if (result.changes === 0) {
+  if (changes === 0) {
     res.status(404).json({ error: { message: 'Key not found' } });
     return;
   }
@@ -95,8 +109,7 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
-// Toggle all keys for a platform
-keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
+keysRouter.patch('/platform/:platform', async (req: Request, res: Response) => {
   const platform = req.params.platform as string;
   if (!(PLATFORMS as readonly string[]).includes(platform)) {
     res.status(400).json({ error: { message: `Invalid platform '${platform}'` } });
@@ -109,14 +122,21 @@ keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
     return;
   }
 
-  const db = getDb();
-  const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE platform = ?').run(enabled ? 1 : 0, platform);
+  let changes = 0;
+  if (isMongo()) {
+    const col = getApiKeysCollection();
+    const result = await col.updateMany({ platform }, { $set: { enabled: enabled ? 1 : 0 } });
+    changes = result.modifiedCount;
+  } else {
+    const db = getDb();
+    const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE platform = ?').run(enabled ? 1 : 0, platform);
+    changes = result.changes;
+  }
 
-  res.json({ success: true, enabled, updatedKeys: result.changes });
+  res.json({ success: true, enabled, updatedKeys: changes });
 });
 
-// Toggle enable/disable
-keysRouter.patch('/:id', (req: Request, res: Response) => {
+keysRouter.patch('/:id', async (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
   if (isNaN(id)) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
@@ -129,10 +149,19 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
     return;
   }
 
-  const db = getDb();
-  const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id);
+  let changes = 0;
+  if (isMongo()) {
+    const col = getApiKeysCollection();
+    const result = await col.updateOne({ _id: id as any }, { $set: { enabled: enabled ? 1 : 0 } });
+    if (result.matchedCount === 0) changes = 0;
+    else changes = 1;
+  } else {
+    const db = getDb();
+    const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id);
+    changes = result.changes;
+  }
 
-  if (result.changes === 0) {
+  if (changes === 0) {
     res.status(404).json({ error: { message: 'Key not found' } });
     return;
   }

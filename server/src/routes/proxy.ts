@@ -5,53 +5,35 @@ import { z } from 'zod';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getNextCooldownDuration } from '../services/ratelimit.js';
-import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { getDb, isMongo, getUnifiedApiKey, getModelsCollection, getRequestsCollection } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 
 export const proxyRouter = Router();
 
-// Virtual "auto" model. Clients like Hermes require a non-empty `model` field
-// on every request, but freellmapi's whole point is to pick the model itself.
-// Requesting this id means "let the router decide" — identical to omitting
-// `model` entirely.
 const AUTO_MODEL_ID = 'auto';
 
 function isAutoModel(modelId: string | undefined): boolean {
   return modelId === AUTO_MODEL_ID;
 }
 
-// Constant-time string comparison for the unified API key. Plain `===` leaks
-// length and per-character timing, which a network attacker could in principle
-// use to recover the key one byte at a time.
 function timingSafeStringEqual(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
-  // Compare against a same-length buffer regardless of input length so the
-  // comparison itself runs in constant time; the explicit length check at the
-  // end is what actually decides equality when lengths differ.
   const compareA = a.length === b.length ? a : Buffer.alloc(b.length);
   return crypto.timingSafeEqual(compareA, b) && a.length === b.length;
 }
 
-// Sticky sessions: track which model served each "session"
-// Key: hash of first user message → model_db_id
-// This prevents model switching mid-conversation which causes hallucination
-const stickySessionMap = new Map<string, { modelDbId: number; lastUsed: number }>();
-const STICKY_TTL_MS = 30 * 60 * 1000; // 30 min session TTL
+const stickySessionMap = new Map<string, { modelDbId: string; lastUsed: number }>();
+const STICKY_TTL_MS = 30 * 60 * 1000;
 
 function getSessionKey(messages: ChatMessage[]): string {
-  // Use the first user message as session identifier — clients like Hermes
-  // re-send the full conversation each turn, so the first user message is
-  // stable across turns. Hash the FULL message (not a 100-char slice) so
-  // distinct conversations with identical openings don't collide.
   const firstUser = messages.find(m => m.role === 'user');
   if (!firstUser || typeof firstUser.content !== 'string') return '';
   const hash = crypto.createHash('sha1').update(firstUser.content).digest('hex');
   return `${hash}:${messages.length > 2 ? 'multi' : 'single'}`;
 }
 
-function getStickyModel(messages: ChatMessage[]): number | undefined {
-  // Only apply sticky for multi-turn (has assistant messages = continuation)
+function getStickyModel(messages: ChatMessage[]): string | undefined {
   const hasAssistant = messages.some(m => m.role === 'assistant');
   if (!hasAssistant) return undefined;
 
@@ -68,12 +50,11 @@ function getStickyModel(messages: ChatMessage[]): number | undefined {
   return entry.modelDbId;
 }
 
-function setStickyModel(messages: ChatMessage[], modelDbId: number) {
+function setStickyModel(messages: ChatMessage[], modelDbId: string) {
   const key = getSessionKey(messages);
   if (!key) return;
   stickySessionMap.set(key, { modelDbId, lastUsed: Date.now() });
 
-  // Cleanup old entries
   if (stickySessionMap.size > 500) {
     const now = Date.now();
     for (const [k, v] of stickySessionMap) {
@@ -82,10 +63,16 @@ function setStickyModel(messages: ChatMessage[], modelDbId: number) {
   }
 }
 
-// OpenAI-compatible /models endpoint (used by Hermes for metadata)
-proxyRouter.get('/models', (_req: Request, res: Response) => {
-  const db = getDb();
-  const models = db.prepare('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
+proxyRouter.get('/models', async (_req: Request, res: Response) => {
+  let models: any[];
+  if (isMongo()) {
+    const col = getModelsCollection();
+    models = await col.find({ enabled: 1 }).sort({ intelligence_rank: 1 }).project({ platform: 1, model_id: 1, display_name: 1, context_window: 1 }).toArray();
+  } else {
+    const db = getDb();
+    models = db.prepare('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
+  }
+
   res.json({
     object: 'list',
     data: [
@@ -97,7 +84,7 @@ proxyRouter.get('/models', (_req: Request, res: Response) => {
         name: 'Auto (router picks the best available model)',
         context_window: null,
       },
-      ...models.map(m => ({
+      ...models.map((m: any) => ({
         id: m.model_id,
         object: 'model',
         created: 0,
@@ -121,11 +108,6 @@ const toolCallSchema = z.object({
   thought_signature: z.string().optional(),
 });
 
-// OpenAI multimodal envelope. Clients like opencode / continue.dev send
-// content as an array of typed blocks even when only text is present. We
-// accept the envelope on the wire and flatten to string for providers that
-// don't support arrays (Cohere, Cloudflare). Non-text blocks pass z validation
-// but get dropped by contentToString — vision/audio still isn't supported.
 const contentBlockSchema = z.object({ type: z.string() }).passthrough();
 const contentSchema = z.union([z.string(), z.array(contentBlockSchema)]);
 
@@ -212,29 +194,17 @@ export function isRetryableError(err: any): boolean {
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('503') || msg.includes('unavailable')
     || msg.includes('500') || msg.includes('internal server error')
-    // 413: this model's payload limit is too small for the request, but another
-    // provider in the fallback chain may have a larger limit. Same reasoning as 503.
     || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
     || msg.includes('request entity too large') || msg.includes('content too large')
-    // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
-    // for a model that's been pulled). Rotate to the next model in the chain —
-    // setCooldown + the health checker will avoid this model on subsequent requests.
     || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
-    // 400: one provider may reject parameters another accepts (e.g. max_tokens
-    // limits, unsupported params). The matching pattern is "api error 400"
-    // which comes from the OpenAI-compat provider's error formatting, not
-    // a bare "400" which is deliberately non-retryable for validation errors.
     || msg.includes('api error 400');
 }
 
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
-  // Authenticate with the unified API key for every proxy request, including
-  // loopback callers. Browser pages can reach localhost, so socket locality is
-  // not a reliable authorization boundary.
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-  const unifiedKey = getUnifiedApiKey();
+  const unifiedKey = await getUnifiedApiKey();
   if (!token || !timingSafeStringEqual(token, unifiedKey)) {
     res.status(401).json({
       error: { message: 'Invalid API key', type: 'authentication_error' },
@@ -242,7 +212,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  // Validate request
   const parsed = chatCompletionSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({
@@ -269,7 +238,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         })) } : {}),
       };
     }
-
     if (m.role === 'tool') {
       return {
         role: 'tool',
@@ -278,7 +246,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         ...(m.name ? { name: m.name } : {}),
       };
     }
-
     return {
       role: m.role,
       content: m.content,
@@ -286,33 +253,35 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     };
   });
 
-  // Token estimation is intentionally a heuristic (~4 chars per token). Used
-  // for routing decisions (skip a model whose budget is too small) and for
-  // streaming bookkeeping where the provider doesn't echo a final usage count.
-  // Non-streaming requests reconcile against the provider's real `usage` block
-  // (see line ~340). Streaming will drift from real consumption — accepted
-  // tradeoff because per-request usage isn't always returned mid-stream.
   const estimatedInputTokens = messages.reduce((sum, m) => {
     const text = contentToString(m.content);
     return sum + Math.ceil(text.length / 4);
   }, 0);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
-  // Explicit `model` field pins routing. If the catalog has no enabled row
-  // matching the requested id, return 400 — silently auto-routing to a
-  // different model would be surprising to OpenAI-compatible clients.
-  // Sticky-session is the fallback when no `model` field was sent at all.
-  let preferredModel: number | undefined;
+  let preferredModel: string | undefined;
   if (isAutoModel(requestedModel)) {
-    // Explicit "auto" → behave exactly like an omitted model field.
     preferredModel = getStickyModel(messages);
   } else if (requestedModel) {
-    const db = getDb();
-    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
-    if (enabled) {
-      preferredModel = enabled.id;
+    let enabled: any;
+    if (isMongo()) {
+      const col = getModelsCollection();
+      enabled = await col.findOne({ model_id: requestedModel, enabled: 1 });
     } else {
-      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+      const db = getDb();
+      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    }
+    if (enabled) {
+      preferredModel = String(isMongo() ? enabled._id.toString() : enabled.id);
+    } else {
+      let disabled: any;
+      if (isMongo()) {
+        const col = getModelsCollection();
+        disabled = await col.findOne({ model_id: requestedModel });
+      } else {
+        const db = getDb();
+        disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+      }
       const reason = disabled ? 'is disabled' : 'is not in the catalog';
       res.status(400).json({
         error: {
@@ -327,16 +296,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     preferredModel = getStickyModel(messages);
   }
 
-  // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
   let lastError: any = null;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel);
+      route = await routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel);
     } catch (err: any) {
-      // No more models available
       if (lastError) {
         res.status(429).json({
           error: {
@@ -352,13 +319,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       return;
     }
 
-    recordRequest(route.platform, route.modelId, route.keyId);
+    await recordRequest(route.platform, route.modelId, route.keyId);
 
     try {
       if (stream) {
-        // Lazy header set: pre-stream errors stay retryable (no headers sent yet);
-        // mid-stream errors emit an `error` SSE frame so the client sees a real signal
-        // instead of a silently truncated stream.
         let totalOutputTokens = 0;
         let streamStarted = false;
         try {
@@ -382,32 +346,26 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
 
           if (!streamStarted) {
-            // Upstream returned no chunks — emit minimal successful stream.
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
           }
           res.write('data: [DONE]\n\n');
           res.end();
 
-          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
+          await recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId);
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
+          await logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
           return;
         } catch (streamErr: any) {
           if (streamStarted) {
-            // Mid-stream error — finish the SSE response cleanly instead of leaving
-            // the client hanging or letting Express's default handler take over.
-            // Full upstream message goes to the log; the client sees a generic
-            // message so we don't leak provider internals into a partial stream.
             console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, streamErr.message);
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
+            await logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
             return;
           }
-          // Pre-stream error — bubble to outer retry/502 handler.
           throw streamErr;
         }
       } else {
@@ -417,7 +375,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         );
 
         const totalTokens = result.usage?.total_tokens ?? 0;
-        recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
+        await recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId);
 
@@ -425,7 +383,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
         res.json(result);
 
-        logRequest(
+        await logRequest(
           route.platform, route.modelId, route.keyId, 'success',
           result.usage?.prompt_tokens ?? 0,
           result.usage?.completion_tokens ?? 0,
@@ -435,13 +393,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
     } catch (err: any) {
       const latency = Date.now() - start;
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, err.message);
+      await logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, err.message);
 
       if (isRetryableError(err)) {
-        // Put this model+key on cooldown and try the next one
         const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
         skipKeys.add(skipId);
-        setCooldown(
+        await setCooldown(
           route.platform,
           route.modelId,
           route.keyId,
@@ -453,7 +410,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         continue;
       }
 
-      // Non-retryable error (auth, 4xx, etc.): don't retry
       res.status(502).json({
         error: {
           message: `Provider error (${route.displayName}): ${err.message}`,
@@ -464,7 +420,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     }
   }
 
-  // Exhausted all retries
   res.status(429).json({
     error: {
       message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
@@ -473,10 +428,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   });
 });
 
-function logRequest(
+async function logRequest(
   platform: string,
   modelId: string,
-  keyId: number,
+  keyId: string | number,
   status: string,
   inputTokens: number,
   outputTokens: number,
@@ -484,11 +439,22 @@ function logRequest(
   error: string | null,
 ) {
   try {
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error);
+    if (isMongo()) {
+      const col = getRequestsCollection();
+      await col.insertOne({
+        platform, model_id: modelId, key_id: keyId, status,
+        input_tokens: inputTokens, output_tokens: outputTokens,
+        latency_ms: latencyMs, error,
+        created_at: new Date().toISOString(),
+      });
+    } else {
+      const db = getDb();
+      const kid = typeof keyId === 'string' ? parseInt(keyId, 10) : keyId;
+      db.prepare(`
+        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(platform, modelId, kid, status, inputTokens, outputTokens, latencyMs, error);
+    }
   } catch (e) {
     console.error('Failed to log request:', e);
   }

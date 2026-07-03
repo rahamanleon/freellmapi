@@ -15,5 +15,14 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
-  }
+  },
+  "author": "Rahaman Leon (rahamanleon16@gmail.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rahamanleon/freellmapi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rahamanleon/freellmapi/issues"
+  },
+  "homepage": "https://github.com/rahamanleon/freellmapi"
 }

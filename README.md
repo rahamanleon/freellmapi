@@ -6,7 +6,7 @@
 
 Aggregate the free tiers from Google, Groq, Cerebras, SambaNova, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, HuggingFace, and Z.ai (Zhipu) behind a single `/v1/chat/completions` endpoint. Keys are stored encrypted. A router picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every free-tier cap.
 
-[![CI](https://github.com/tashfeenahmed/freellmapi/actions/workflows/ci.yml/badge.svg)](https://github.com/tashfeenahmed/freellmapi/actions/workflows/ci.yml)
+[![CI](https://github.com/rahamanleon/freellmapi/actions/workflows/ci.yml/badge.svg)](https://github.com/rahamanleon/freellmapi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
@@ -95,7 +95,7 @@ PRs that add any of these are very welcome. See [Contributing](#contributing).
 **Prerequisites:** Node.js 20+, npm.
 
 ```bash
-git clone https://github.com/tashfeenahmed/freellmapi.git
+git clone https://github.com/rahamanleon/freellmapi.git
 cd freellmapi
 npm install
 

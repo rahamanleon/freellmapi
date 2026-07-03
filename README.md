@@ -339,8 +339,18 @@ Removed since the April 2026 review: Hugging Face, Moonshot, and MiniMax direct 
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/chart?repos=tashfeenahmed/freellmapi&type=date&legend=top-left)](https://www.star-history.com/?repos=tashfeenahmed%2Ffreellmapi&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/chart?repos=rahamanleon/freellmapi&type=date&legend=top-left)](https://www.star-history.com/?repos=tashfeenahmed%2Ffreellmapi&type=date&legend=top-left)
 
 ## License
 
 [MIT](./LICENSE)
+
+
+---
+
+## 📬 Contact
+
+- **Author**: [Rahaman Leon](https://github.com/rahamanleon)
+- **Email**: rahamanleon16@gmail.com
+- **GitHub**: [https://github.com/rahamanleon](https://github.com/rahamanleon)
+- **Repository**: [https://github.com/rahamanleon/freellmapi](https://github.com/rahamanleon/freellmapi)

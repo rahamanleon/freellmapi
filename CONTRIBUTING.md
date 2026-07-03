@@ -10,7 +10,7 @@
 
 ## Development Setup
 ```bash
-git clone https://github.com/YOUR_USERNAME/freellmapi.git
+git clone https://github.com/rahamanleon/freellmapi.git
 cd freellmapi
 npm install
 npm run dev

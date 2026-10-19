@@ -24,6 +24,18 @@
       "platform": "aihorde",
       "label": "keyless",
       "enabled": true
+    },
+    {
+      "platform": "google",
+      "key": "REDACTED",
+      "label": "main",
+      "enabled": true
+    },
+    {
+      "platform": "groq",
+      "key": "REDACTED",
+      "label": "main",
+      "enabled": true
     }
   ],
   "routing": {

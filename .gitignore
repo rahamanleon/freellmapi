@@ -39,3 +39,8 @@ freellmapi/.git/
 *.out
 *.err
 *.log
+
+# ---- config backups -------------------------------------------------------
+# Written by the add-a-key workflow before every edit. They duplicate every
+# secret in the repo, so they are never committed.
+ops/secrets/*.bak-*

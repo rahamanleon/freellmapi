@@ -1,0 +1,33 @@
+{
+  "admin": {
+    "email": "you@example.com",
+    "password": "replace-with-a-long-random-password"
+  },
+  "keys": [
+    {
+      "platform": "openrouter",
+      "key": "sk-or-v1-REPLACE_WITH_YOUR_KEY",
+      "label": "main",
+      "enabled": true
+    },
+    {
+      "platform": "kilo",
+      "label": "keyless",
+      "enabled": true
+    },
+    {
+      "platform": "ovh",
+      "label": "keyless",
+      "enabled": true
+    },
+    {
+      "platform": "aihorde",
+      "label": "keyless",
+      "enabled": true
+    }
+  ],
+  "routing": {
+    "strategy": "balanced",
+    "keySelectionStrategy": "auto"
+  }
+}

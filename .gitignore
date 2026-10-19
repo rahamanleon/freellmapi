@@ -1,0 +1,43 @@
+# ============================================================================
+# Credentials - NEVER commit any of these.
+#
+# ops/freellmapi.config.json holds the dashboard admin password and the live
+# provider API keys. ops/secrets/ holds the ENCRYPTION_KEY (which also encrypts
+# database backups) and a copy of that password.
+#
+# These live here, on disk, ACL-restricted to one user account. They are
+# supplied to Render through its secret prompt, never through Git.
+# ============================================================================
+ops/freellmapi.config.json
+ops/secrets/
+
+# ============================================================================
+# The upstream FreeLLMAPI checkout (~448 MB, of which 361 MB is node_modules).
+#
+# It is a clone of a public project and has its own .git directory, so there is
+# nothing of ours to publish in it. It also contains .env (the encryption key)
+# and server/data/freeapi.db (the live database, including the unified API key).
+# ============================================================================
+freellmapi/
+
+# ============================================================================
+# Databases and backups
+# ============================================================================
+*.db
+*.db-wal
+*.db-shm
+*.backup
+
+# ============================================================================
+# Environment files, wherever they appear
+# ============================================================================
+.env
+*.env
+!.env.example
+
+# ============================================================================
+# Local scratch output
+# ============================================================================
+*.out
+*.err
+*.log

@@ -1,0 +1,103 @@
+# Render Blueprint for FreeLLMAPI (the gateway behind the Durin Agent).
+#
+# Deploys the UPSTREAM prebuilt image from GHCR — no fork, no build step.
+#
+#   image : ghcr.io/tashfeenahmed/freellmapi:sha-f76b552
+#   ==     upstream git tag v0.16.3
+#          commit f76b5528d40352ad16c1ceff4d91d8f7717e6785
+#
+# Verified against the registry API (2026-10-19):
+#   * the repository is publicly pullable with an anonymous token
+#   * sha-f76b552 exists and is a multi-arch index with linux/amd64 + linux/arm64
+#   * no "v0.16.3"-style tag is published on GHCR (version tags stop at v0.13.0),
+#     so the commit-SHA tag is the only reproducible pin.
+#
+# ---------------------------------------------------------------------------
+# Why this file looks the way it does
+# ---------------------------------------------------------------------------
+# Render's Free plan shapes almost every choice here:
+#   * No persistent disks on Free, and the filesystem is wiped on every
+#     spin-down / redeploy. The SQLite database therefore lives on ephemeral
+#     storage and durability comes ENTIRELY from FreeLLMAPI's encrypted backup
+#     pump (FREEAPI_DB_BACKUP_*), which restores automatically on cold start.
+#   * Free services spin down after ~15 min idle (cold start ~30-60 s).
+#   * Free services may be restarted at any time, without notice.
+#   * 512 MB RAM / 0.1 CPU, 750 instance-hours per workspace per calendar month.
+#
+# Because the database starts empty on every container, the declarative config
+# MUST be complete: it is what recreates the provider keys, routing and admin
+# account on each boot. It is supplied inline through FREEAPI_CONFIG_JSON,
+# which takes precedence over FREEAPI_CONFIG_PATH (a config FILE cannot be
+# mounted into a prebuilt image).
+#
+# Secrets are declared with `sync: false`: Render prompts for them on first
+# apply and never writes them into Git or this Blueprint.
+
+services:
+  - type: web
+    name: freellmapi
+    runtime: image
+    image:
+      url: ghcr.io/tashfeenahmed/freellmapi:sha-f76b552
+    plan: free
+    region: singapore # closest Render region to Bangladesh
+    healthCheckPath: /api/ping # verified: returns 200 {"status":"ok"}
+    autoDeployTrigger: off # the image is pinned by SHA; nothing to rebuild
+    envVars:
+      # --- runtime ----------------------------------------------------------
+      - key: NODE_ENV
+        value: production
+
+      # The image binds to '::' (dual-stack) by default. Pin to 0.0.0.0 so
+      # Render's proxy is guaranteed to reach the listener.
+      # PORT is injected by Render and overrides the image's `ENV PORT=3001`.
+      - key: HOST
+        value: 0.0.0.0
+
+      # Behind Render's proxy, so per-client rate limiting must read
+      # X-Forwarded-For. Without this every request looks like one client.
+      - key: TRUST_PROXY
+        value: "1"
+
+      # Single-tenant container: allow the data dir to be hardened to 0700.
+      # Without it the server warns that /app/server/data is not a directory it
+      # created (true — the Dockerfile did).
+      - key: FREEAPI_DB_DIR_HARDENING
+        value: "1"
+
+      # --- secrets (Render prompts for these; they are never stored here) ---
+      #
+      # ENCRYPTION_KEY: 64 hex characters. Encrypts provider keys at rest AND
+      # is the default key for the database backup. If this changes, existing
+      # backups become unreadable — treat it as permanent.
+      - key: ENCRYPTION_KEY
+        sync: false
+
+      # The entire contents of ops/freellmapi.config.json, as a single-line
+      # JSON string. See RUNBOOK.md -> "Deploying to Render" for how to
+      # generate this value without breaking it across lines.
+      - key: FREEAPI_CONFIG_JSON
+        sync: false
+
+      # --- encrypted database backup (persistence) --------------------------
+      #
+      # A Hugging Face *dataset* resolve URL, e.g.
+      #   https://huggingface.co/datasets/<user>/<repo>/resolve/main/freellmapi.db.backup
+      # The repo must be PRIVATE and the token must have write access.
+      # Leave empty to disable backup — the service still runs, but the
+      # unified API key will change on every spin-down, breaking clients.
+      - key: FREEAPI_DB_BACKUP_URL
+        sync: false
+      - key: FREEAPI_DB_BACKUP_TOKEN
+        sync: false
+
+      # FREEAPI_DB_BACKUP_KEY is intentionally omitted: it falls back to
+      # ENCRYPTION_KEY. Set it explicitly ONLY if you want backups encrypted
+      # with a different key (and then store that key somewhere safe).
+
+      # Backup cadence. The pump uploads immediately at boot (which captures the
+      # freshly generated unified API key), then on this interval. There is no
+      # flush on SIGTERM, so this is the maximum amount of database change that
+      # spin-down can lose. Upstream default is 300000 (5 min).
+      - key: FREEAPI_DB_BACKUP_INTERVAL_MS
+        value: "300000"

@@ -1,0 +1,13 @@
+# Never commit credentials.
+#
+# ops/freellmapi.config.json contains the dashboard admin password and live
+# provider API keys, because that is the only declarative path FreeLLMAPI
+# supports for them.
+freellmapi.config.json
+
+# Encryption key, dashboard password, scratch databases and backup blobs.
+secrets/
+
+# Local scratch output from the durability test.
+*.out
+*.err

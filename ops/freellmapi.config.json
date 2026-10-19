@@ -36,6 +36,11 @@
       "key": "REDACTED",
       "label": "main",
       "enabled": true
+    },
+    {
+      "platform": "parallel",
+      "label": "keyless",
+      "enabled": true
     }
   ],
   "routing": {

@@ -47,6 +47,12 @@
       "key": "REDACTED",
       "label": "main",
       "enabled": true
+    },
+    {
+      "platform": "mistral",
+      "key": "REDACTED",
+      "label": "main",
+      "enabled": true
     }
   ],
   "routing": {

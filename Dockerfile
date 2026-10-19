@@ -41,15 +41,50 @@ FROM ghcr.io/tashfeenahmed/freellmapi:sha-f76b552
 #   FREEAPI_DB_DIR_HARDENING=1    single-tenant container: allow the data dir to
 #                                 be chmod 0700 without warning
 #
-# ENCRYPTION_KEY is deliberately NOT set here. Two reasons: in production the
-# server refuses to boot without it (server/src/lib/crypto.ts), and baking a key
-# into an image layer would ship the secret inside the image. Set it as an
-# environment variable on the service instead.
-#
-# FREEAPI_CONFIG_JSON is likewise not set here: it contains the live provider
-# API keys and must be supplied as a service environment variable.
+# ENCRYPTION_KEY and the provider config are deliberately NOT set here as plain
+# ENV values - see the self-contained section below, which delivers them as
+# files instead.
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     TRUST_PROXY=1 \
     FREEAPI_DB_DIR_HARDENING=1 \
     FREEAPI_DB_BACKUP_INTERVAL_MS=300000
+
+# ---------------------------------------------------------------------------
+# Self-contained secrets: nothing to type into the host
+# ---------------------------------------------------------------------------
+# This service needs NO environment variables entered in the Render UI. Both
+# secrets are carried inside the image:
+#
+#   /app/.env                    ENCRYPTION_KEY
+#   /app/freellmapi.config.json  admin account + provider API keys + routing
+#
+# Why these two locations:
+#
+#   * The server calls dotenv on /app/.env at boot - server/src/env.ts runs
+#     `dotenv.config({ path: ... '../../.env' })` and server/src/index.ts imports
+#     it on its first line. From /app/server/dist the resolved path is exactly
+#     /app/.env. dotenv does NOT overwrite variables that already exist, so
+#     setting ENCRYPTION_KEY on the host still wins if you ever want to override.
+#
+#   * With no FREEAPI_CONFIG_JSON present, the server reads the declarative
+#     config from FREEAPI_CONFIG_PATH. (FREEAPI_CONFIG_JSON takes precedence when
+#     both are set.)
+#
+# Why ENCRYPTION_KEY is not simply a field in config.json - it cannot be:
+#   * server/src/services/declarative-config.ts validates with a `.strict()` zod
+#     object, so ANY unknown top-level key is rejected outright. Adding
+#     "ENCRYPTION_KEY": "..." fails with
+#       invalid declarative config: Unrecognized key(s) in object: 'ENCRYPTION_KEY'
+#   * server/src/lib/crypto.ts reads process.env.ENCRYPTION_KEY and nothing else
+#     (initEncryptionKey, line 96). Outside NODE_ENV=production it would
+#     auto-generate a key file, but in production it throws at boot instead.
+#   * The .env file is therefore the only file-based source it accepts.
+#
+# Both files are already tracked in this private repository, so nothing is
+# exposed here that was not already committed - the image is simply a different
+# delivery mechanism for the same secrets. To rotate the key, edit
+# freellmapi/.env and redeploy.
+COPY freellmapi/.env /app/.env
+COPY ops/freellmapi.config.json /app/freellmapi.config.json
+ENV FREEAPI_CONFIG_PATH=/app/freellmapi.config.json

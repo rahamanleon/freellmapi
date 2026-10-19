@@ -292,6 +292,19 @@ disabling a provider).
 `render.yaml`, at the repository root, is ready. It deploys the pinned upstream
 image - no fork, no build.
 
+> **Two deploy paths, and they differ in where secrets come from.**
+>
+> * **Docker service (root `Dockerfile`) - self-contained.** The Dockerfile copies
+>   `freellmapi/.env` and `ops/freellmapi.config.json` into the image, so the
+>   service needs **no environment variables at all**. This is the path in use.
+> * **Blueprint (`render.yaml`, `runtime: image`) - prompts.** It pulls the
+>   upstream image directly, so it carries no copy of those files and still asks
+>   for the four `sync: false` secrets in step 3.
+>
+> `FREEAPI_CONFIG_JSON` takes precedence over `FREEAPI_CONFIG_PATH`, so setting it
+> on a Docker-path service overrides the baked-in file. Harmless while the two
+> hold identical content (they currently do).
+
 ### Steps
 
 1. Push this repository to GitHub. It is **private**, and it deliberately carries

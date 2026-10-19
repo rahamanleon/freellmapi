@@ -41,6 +41,12 @@
       "platform": "parallel",
       "label": "keyless",
       "enabled": true
+    },
+    {
+      "platform": "zhipu",
+      "key": "REDACTED",
+      "label": "main",
+      "enabled": true
     }
   ],
   "routing": {

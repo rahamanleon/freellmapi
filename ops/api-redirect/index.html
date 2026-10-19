@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FreeLLMAPI - API reference</title>
+<meta name="robots" content="noindex">
+<!--
+  Why this file exists
+  --------------------
+  /api is NOT an API route. The SPA fallback in server/src/app.ts (line ~367)
+  serves the dashboard shell (client/dist/index.html) for every path that is not
+  /api/, /v1/ or /v1beta/, so GET /api shows the dashboard, which explains
+  nothing about the API.
+
+  The real reference ships with the app at GET /v1/docs (server/src/routes/
+  docs.ts), an unauthenticated OpenAPI viewer over /v1/openapi.json. This page
+  redirects /api to it.
+
+  Why a <meta refresh> and not JavaScript: the app's helmet CSP is
+  scriptSrc ["'self'", <one hashed inline hash>], so any inline <script> here
+  would be blocked. Meta refresh is not covered by CSP. Inline CSS is allowed
+  (styleSrc includes 'unsafe-inline'), so the styling below is safe.
+-->
+<meta http-equiv="refresh" content="0; url=/v1/docs">
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0;
+    padding: 3rem 1.25rem;
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 .35rem; }
+  h2 { font-size: 1rem; margin: 2rem 0 .5rem; }
+  p, li { margin: .4rem 0; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .92em;
+    padding: .1em .35em;
+    border-radius: .25rem;
+    background: rgba(127, 127, 127, .18);
+  }
+  hr { border: 0; border-top: 1px solid rgba(127, 127, 127, .35); margin: 2rem 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>FreeLLMAPI - API reference</h1>
+  <p>Redirecting to the full API documentation&hellip;</p>
+  <p>If you are not redirected, open <a href="/v1/docs"><code>/v1/docs</code></a>.</p>
+
+  <hr>
+
+  <h2>Paths worth knowing</h2>
+  <ul>
+    <li>Full reference (OpenAPI viewer): <a href="/v1/docs"><code>/v1/docs</code></a></li>
+    <li>Machine-readable spec: <a href="/v1/openapi.json"><code>/v1/openapi.json</code></a> (import into Postman, Insomnia, or any OpenAPI client)</li>
+    <li>Liveness: <code>/api/ping</code> &middot; readiness: <code>/livez</code>, <code>/readyz</code></li>
+  </ul>
+
+  <h2>Using the API</h2>
+  <ul>
+    <li>Base URL: <code>/v1</code> on this host (OpenAI-compatible)</li>
+    <li>Auth: <code>Authorization: Bearer &lt;your unified API key&gt;</code> &mdash; the same key serves every <code>/v1</code> route</li>
+    <li>Chat: <code>POST /v1/chat/completions</code></li>
+    <li>Models: <code>GET /v1/models</code>, or send <code>"model": "auto"</code> and let the router pick</li>
+    <li>Web search: <code>POST /v1/search</code>, engines listed by <code>GET /v1/search/engines</code></li>
+  </ul>
+</main>
+</body>
+</html>

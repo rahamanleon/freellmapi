@@ -88,3 +88,28 @@ ENV NODE_ENV=production \
 COPY freellmapi/.env /app/.env
 COPY ops/freellmapi.config.json /app/freellmapi.config.json
 ENV FREEAPI_CONFIG_PATH=/app/freellmapi.config.json
+
+# ---------------------------------------------------------------------------
+# GET /api -> the API reference
+# ---------------------------------------------------------------------------
+# /api is not an API route. The SPA fallback in server/src/app.ts (~line 367)
+# serves the dashboard shell for every path except /api/, /v1/ and /v1beta/, so
+# GET /api returns the dashboard, which says nothing about the API. The real
+# reference ships with the app at GET /v1/docs (server/src/routes/docs.ts - an
+# unauthenticated OpenAPI viewer over /v1/openapi.json). This drops a redirect
+# page into the built dashboard so /api lands on it.
+#
+# Why this path works, with no code change:
+#   * clientDist resolves to /app/client/dist - app.ts:342-344 does
+#     path.resolve(__dirname, '../../client/dist') and __dirname is
+#     /app/server/dist; upstream Dockerfile line 53 copies the built dashboard
+#     to ./client/dist from /app.
+#   * express.static(clientDist) uses serve-static's default index
+#     ('index.html'), so a directory request serves its index.html:
+#       GET /api  -> 301 -> /api/  -> /app/client/dist/api/index.html
+#   * the static mount sits BEFORE the SPA fallback, and the fallback skips any
+#     path starting with /api/, so nothing else competes for /api.
+#
+# To drop this redirect, delete the COPY below and redeploy. Nothing else
+# depends on it.
+COPY ops/api-redirect/index.html /app/client/dist/api/index.html

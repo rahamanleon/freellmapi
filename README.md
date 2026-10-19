@@ -50,25 +50,44 @@ in this repository.
 
 ```
 render.yaml                     Render Blueprint (must be at the repo root)
+freellmapi/                     upstream FreeLLMAPI checkout, tag v0.16.3 (source only)
 ops/                            operations toolkit and documentation
   README.md                     index of the toolkit
   RUNBOOK.md                    full operations manual - read this
+  freellmapi.config.json        REAL config: dashboard password + provider API keys
   freellmapi.config.example.json  sanitized config template
+  secrets/                      ENCRYPTION_KEY + dashboard password backup
   scripts/                      verification and diagnostics
     validate-config.mjs         preflight config against the REAL upstream loader
     verify-router.mjs           end-to-end chat probe (+ tool-calling mode)
     db-inspect.mjs              state report; secrets redacted to a SHA-256 prefix
     list-models.mjs             what the gateway exposes on GET /v1/models
     test-backup-restore.ps1     proves the unified key survives a filesystem wipe
-  secrets/                      ENCRYPTION_KEY + dashboard password  [GIT-IGNORED]
-  freellmapi.config.json        real config with live keys            [GIT-IGNORED]
 ```
 
-**Not in this repository, by design:**
+## This repository contains live credentials
 
-- `ops/secrets/` and `ops/freellmapi.config.json` — credentials. See `.gitignore`.
-- `freellmapi/` — the local upstream checkout (~448 MB). It is a clone of a public
-  project and contains its own `.env` and live database.
+**It is private, and it is private on purpose.** It holds:
+
+| Path | Credential |
+| --- | --- |
+| `ops/freellmapi.config.json` | dashboard admin password + provider API keys |
+| `ops/secrets/encryption-key.txt` | `ENCRYPTION_KEY` (also the database backup key) |
+| `ops/secrets/dashboard-password.txt` | dashboard password |
+| `freellmapi/.env` | `ENCRYPTION_KEY` as the gateway reads it at runtime |
+
+The trade-off, stated once so it is not a surprise later: this makes the install fully
+reproducible from a clone, at the cost of the credentials living in Git. **Git history is
+permanent** — if this repository is ever made public or a collaborator is added, deleting
+the files afterwards does not undo it, and the values must be **rotated**:
+
+- a new `ENCRYPTION_KEY` invalidates every existing database backup
+- a new unified API key invalidates every client, including the Durin Agent
+
+**Deliberately excluded** (binary, huge, or rebuildable — `git add -f` if you ever want
+them): `freellmapi/node_modules/` (361 MB), `freellmapi/.git/` (26 MB, the clone's own
+history), `**/dist/` (build output), and `freellmapi/server/data/*.db` (the live database,
+which contains the unified API key and is rewritten constantly).
 
 ## Read this before you rely on it
 

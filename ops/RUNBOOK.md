@@ -47,7 +47,7 @@ These are three different things and must not be conflated:
 
 | Store | Owned by | Holds | Why |
 | --- | --- | --- | --- |
-| **`ops/freellmapi.config.json`** | this repo (git-ignored) | admin account, provider keys, routing policy | Declarative, strict schema, re-applied on every boot. It is what reconstructs a fresh container. |
+| **`ops/freellmapi.config.json`** | this repo (tracked - see section 9) | admin account, provider keys, routing policy | Declarative, strict schema, re-applied on every boot. It is what reconstructs a fresh container. |
 | **Process env vars** | Render / `.env` | `ENCRYPTION_KEY`, backup target, timeouts, caps, proxy trust | The strict config schema has **no** field for these. Anything not in section 4.1 must be an env var. |
 | **SQLite (`freeapi.db`)** | FreeLLMAPI itself | live state: the **unified API key**, dashboard profiles, usage counters, cooldowns | FreeLLMAPI is SQLite-only. Upstream has no MongoDB support anywhere in the codebase. |
 | **MongoDB Atlas** | the Durin Agent | the agent's own records (tasks, task-accounts, results) | Separate system, reached directly by the agent. Not a FreeLLMAPI dependency. |
@@ -294,10 +294,11 @@ image - no fork, no build.
 
 ### Steps
 
-1. Push this repository to GitHub. The root `.gitignore` excludes the two things
-   that must never be published: `ops/secrets/` plus `ops/freellmapi.config.json`
-   (credentials), and `freellmapi/` (the 448 MB upstream clone, which has its own
-   `.env` and live database). `render.yaml` sits at the root, where Render looks
+1. Push this repository to GitHub. It is **private**, and it deliberately carries
+   the live credentials - `ops/freellmapi.config.json`, `ops/secrets/`, and
+   `freellmapi/.env` - next to the upstream source checkout. Section 9 covers the
+   trade-off. `freellmapi/node_modules/`, `freellmapi/.git/`, `**/dist/`, and the
+   live database are excluded. `render.yaml` sits at the root, where Render looks
    for it.
 2. In Render: **New -> Blueprint**, connect that repository.
 3. Render creates one service, `freellmapi`, and prompts for the four
@@ -458,12 +459,17 @@ FreeLLMAPI is not involved here. The agent talks to Atlas directly.
 
 ## 9. Security posture
 
-- `ENCRYPTION_KEY` and the dashboard password exist in exactly two places: the
-  git-ignored files, and `ops\secrets\` (ACL-restricted to the current user).
-  Both are excluded from Git.
+- `ENCRYPTION_KEY` and the dashboard password live in `freellmapi\.env` and
+  `ops\secrets\` (both ACL-restricted to the current user on this machine), and
+  both are now **tracked in this private repository** - the trade-off accepted
+  so that a clone can reproduce the install. Git history is permanent: making
+  the repository public, or adding a collaborator, exposes them, and deleting
+  the files afterwards does not undo it. Recovery means **rotating** the values
+  - a new `ENCRYPTION_KEY` invalidates existing backups, and a new unified API
+  key invalidates every client, including the Durin Agent.
 - Provider API keys live in `ops\freellmapi.config.json` because that is the
-  only declarative path the server supports - it is ACL-restricted and
-  git-ignored.
+  only declarative path the server supports. It is ACL-restricted here and
+  tracked in the private repository.
 - The unified API key is never printed by any script in `ops\scripts\`;
   `db-inspect.mjs` prints a SHA-256 prefix instead.
 - On Render, `/v1` is protected **only** by the unified API key. Do not share

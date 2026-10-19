@@ -50,6 +50,7 @@ in this repository.
 
 ```
 render.yaml                     Render Blueprint (must be at the repo root)
+Dockerfile                      deploys the pinned upstream image (for Docker-runtime hosts)
 freellmapi/                     upstream FreeLLMAPI checkout, tag v0.16.3 (source only)
 ops/                            operations toolkit and documentation
   README.md                     index of the toolkit

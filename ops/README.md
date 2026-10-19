@@ -25,6 +25,7 @@ scripts used to verify it.
 | `scripts/list-models.mjs` | Lists what the gateway exposes on `GET /v1/models` |
 | `scripts/verify-router.mjs` | End-to-end chat completion probe. Add `tools` as the 4th argument to test tool calling |
 | `scripts/test-backup-restore.ps1` | Proves the unified API key survives a full filesystem wipe. Uses a scratch database |
+| `scripts/copy-for-render.ps1` | Puts a Render secret (`config`, `encryption-key`, `password`) on the clipboard without printing it. Validates the config JSON first |
 
 ## Quick commands
 
@@ -43,6 +44,9 @@ node ops\scripts\verify-router.mjs http://127.0.0.1:3001 gpt-oss-120b tools
 
 # prove durability
 powershell -NoProfile -ExecutionPolicy Bypass -File "ops\scripts\test-backup-restore.ps1"
+
+# fill Render's secret prompts without hand-copying a 492-char JSON blob
+powershell -NoProfile -ExecutionPolicy Bypass -File "ops\scripts\copy-for-render.ps1" -Which config
 ```
 
 ## Provider status

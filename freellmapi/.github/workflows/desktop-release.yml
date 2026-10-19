@@ -1,0 +1,507 @@
+name: Desktop release
+
+# Builds the menu-bar desktop app installers (Windows .exe + macOS .dmg) and,
+# on a version tag, attaches them to the GitHub Release. Closes #318 — the
+# dist:win build config already existed; this is the missing publish step.
+#
+# Triggers:
+#   - workflow_dispatch        manual build (artifacts only)
+#   - push tags 'v*'           build + attach the installers to the release
+#   - pull_request (desktop)   build-only smoke test so the Windows build can't
+#                              silently rot (only when desktop/CI files change)
+#
+# Tagged runs check desktop/package.json against the tag before building — see
+# #948, where v0.8.2 through v0.8.4 shipped installers stamped 0.8.1 because
+# nobody bumped that file.
+#
+# Release recipe (installers first, then public):
+#   1. gh release create vX.Y.Z --draft --target <merge sha> --title vX.Y.Z --notes-file notes.md
+#   2. git tag vX.Y.Z <merge sha> && git push origin vX.Y.Z
+#   3. this workflow attaches every installer to the draft, then the `publish`
+#      job flips it to published once all of them are there.
+# A draft is invisible to users, so the release page never shows only the
+# automatic source archives while the ~15 minute build is still running.
+# Fallbacks below create a DRAFT for a tag pushed without a release, for the
+# same reason; `publish` takes care of it.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop-release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned to windows-2022 (VS 2022): node-gyp can't yet parse the VS "18"
+          # toolset on windows-latest, which breaks the better-sqlite3 native build.
+          - os: windows-2022
+            ebArgs: --win --x64
+            artifact: windows-installer
+            glob: |
+              desktop/dist-electron/*.exe
+              desktop/dist-electron/*.zip
+              desktop/dist-electron/*.blockmap
+              desktop/dist-electron/latest.yml
+          - os: macos-latest
+            arch: arm64
+            ebArgs: --mac --arm64
+            artifact: macos-installer-arm64
+            glob: |
+              desktop/dist-electron/*.dmg
+              desktop/dist-electron/*.zip
+              desktop/dist-electron/*.blockmap
+              desktop/dist-electron/latest-mac.yml
+          # Build and exercise better-sqlite3 natively on Intel (#1232).
+          - os: macos-15-intel
+            arch: x64
+            ebArgs: --mac --x64
+            artifact: macos-installer-x64
+            glob: |
+              desktop/dist-electron/*.dmg
+              desktop/dist-electron/*.zip
+              desktop/dist-electron/*.blockmap
+              desktop/dist-electron/latest-mac.yml
+          - os: ubuntu-latest
+            ebArgs: --linux --x64
+            artifact: linux-installer
+            glob: |
+              desktop/dist-electron/*.AppImage
+              desktop/dist-electron/*.tar.xz
+              desktop/dist-electron/*.deb
+              desktop/dist-electron/*.rpm
+              desktop/dist-electron/latest-linux.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '20'
+
+      # better-sqlite3 is rebuilt for Electron with node-gyp, which still
+      # imports Python's distutils (removed in 3.12). Some macos-15-intel images
+      # default to a Python without it, so the rebuild failed there
+      # intermittently ("No module named 'distutils'"). Pin a Python that has
+      # it on the macOS hosts instead of taking whatever the image ships.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: runner.os == 'macOS'
+        with:
+          python-version: '3.11'
+
+      # #948: v0.8.2–v0.8.4 shipped installers stamped 0.8.1 because
+      # desktop/package.json was never bumped after v0.8.1. electron-builder
+      # reads that field for the artifact filenames AND the latest*.yml updater
+      # manifests, so a stale number silently mislabels the whole release and
+      # breaks auto-update. Fail the tagged run here — before the install,
+      # build and package steps — instead of publishing mislabeled artifacts.
+      # Untagged runs (workflow_dispatch, pull_request) have no tag to compare
+      # against and are skipped.
+      - name: Verify desktop version matches the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./desktop/package.json').version")
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error file=desktop/package.json::desktop/package.json is $VERSION, so electron-builder would stamp the artifacts v$VERSION, but the tag is $GITHUB_REF_NAME. Set desktop/package.json and desktop/package-lock.json to ${GITHUB_REF_NAME#v}, then move the tag."
+            exit 1
+          fi
+          echo "desktop/package.json $VERSION matches tag $GITHUB_REF_NAME."
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      # `npm ci` rather than `install`: install rewrites desktop/package-lock.json
+      # in place, which would quietly repair a stale lockfile version before the
+      # lockfile-sync assertion in src/__tests__/version.test.ts ever sees it.
+      # ci installs the lockfile as committed, so that test is a real guard here.
+      - name: Install desktop dependencies
+        run: npm --prefix desktop ci
+
+      # The per-platform window chrome (#703's menu-bar fix) lives in a branch
+      # that never executes on a developer's mac. These run on both matrix
+      # hosts, so the Windows expectations are asserted on Windows.
+      - name: Run desktop tests
+        run: npm --prefix desktop test
+
+      - name: Build client + desktop bundles
+        shell: bash
+        run: |
+          npm run build -w client
+          npm --prefix desktop run build:all
+          # Stage client/dist into desktop/ so electron-builder's extraResources
+          # source stays inside desktop/ (no `../`). Belt-and-suspenders with the
+          # root-hiding below; also makes local `desktop:dist:win` work on Windows.
+          npm --prefix desktop run stage:client
+
+      - name: Validate macOS signing credentials
+        id: maccreds
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
+        run: |
+          set -euo pipefail
+          # No signing cert at all → fall back to an unsigned DMG rather than
+          # failing the release (users bypass Gatekeeper via right-click → Open
+          # or xattr -d com.apple.quarantine). Signing cert present but broken
+          # notarization config is still a hard error — that's a misconfiguration.
+          if [ -z "${CSC_LINK:-}" ]; then
+            echo "::warning::No MACOS_CSC_LINK secret — building an UNSIGNED DMG. Configure Apple Developer ID signing + notarization secrets for a Gatekeeper-clean release."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          has_api_key_creds=false
+          if [ -n "${APPLE_API_KEY_P8:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ]; then
+            has_api_key_creds=true
+          fi
+
+          has_keychain_creds=false
+          if [ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]; then
+            has_keychain_creds=true
+          fi
+
+          if [ "$has_api_key_creds" != true ] && [ "$has_keychain_creds" != true ]; then
+            echo "Missing Apple notarization secrets. Provide APPLE_API_KEY_P8/APPLE_API_KEY_ID/APPLE_API_ISSUER (an App Store Connect API key), or APPLE_KEYCHAIN_PROFILE."
+            exit 1
+          fi
+          if [ "$has_api_key_creds" = true ] && [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "APPLE_TEAM_ID is required alongside the API key so codesign picks the right Developer ID identity."
+            exit 1
+          fi
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "apikey=$has_api_key_creds" >> "$GITHUB_OUTPUT"
+
+      # notarytool takes the App Store Connect key as a FILE (`--key <path>`), but
+      # a GitHub secret is a string, so the .p8 has to be materialised on disk
+      # first. $RUNNER_TEMP is job-scoped and wiped when the job ends, and the
+      # runner is ephemeral, so the key never outlives this build. Writing it
+      # before the package step (rather than inlining a path into that step's
+      # `env:`) keeps the "which credential wins" logic in one place.
+      - name: Write the App Store Connect API key
+        if: steps.maccreds.outputs.signed == 'true' && steps.maccreds.outputs.apikey == 'true'
+        shell: bash
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key_path"
+          chmod 600 "$key_path"
+          # electron-builder reads APPLE_API_KEY as the path to hand notarytool.
+          echo "APPLE_API_KEY=$key_path" >> "$GITHUB_ENV"
+
+      # electron-builder makes its own temp keychain when handed CSC_LINK, and on
+      # the macos-26 runner image that broke: its `security set-key-partition-list`
+      # now fails with "SecKeychainUnlock: The user name or passphrase you entered
+      # is not correct" and the build dies before signing anything. v0.9.5 built
+      # fine on image 20260728.0273.1 and v0.9.6 failed on 20260831.0337.3, same
+      # workflow and same secrets. Importing the certificate ourselves keeps every
+      # keychain command under our control; electron-builder then only needs
+      # CSC_KEYCHAIN (which it uses precisely when CSC_LINK is absent) and finds
+      # the identity through the search list.
+      - name: Import the Developer ID certificate
+        if: steps.maccreds.outputs.signed == 'true'
+        shell: bash
+        env:
+          MACOS_CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
+          MACOS_CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          cert="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$MACOS_CSC_LINK" | base64 --decode > "$cert"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          # Unlocked for the whole build; the runner is ephemeral and wiped after.
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          # -A lets any tool use the key, so codesign still works even when the
+          # partition list below is refused — which is the failure being worked
+          # around here, so it is a warning rather than a hard stop.
+          security import "$cert" -k "$keychain" -P "$MACOS_CSC_KEY_PASSWORD" -A \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$cert"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain" >/dev/null 2>&1 \
+            || echo "::warning::set-key-partition-list was refused; relying on the -A import"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$keychain"
+
+          # Fail here, with the keychain in front of us, rather than ten minutes
+          # later inside electron-builder. Naming the identity explicitly also
+          # spares it an autodiscovery pass over the search list.
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$identity" ]; then
+            echo "No 'Developer ID Application' identity in the imported certificate."
+            security find-identity -v -p codesigning "$keychain" || true
+            exit 1
+          fi
+          echo "Signing identity: $identity"
+          # electron-builder rejects a CSC_NAME carrying the certificate-type
+          # prefix ("Please remove prefix \"Developer ID Application:\" from the
+          # specified name"); it wants the common name alone and re-attaches the
+          # prefix itself when matching identities.
+          {
+            echo "CSC_KEYCHAIN=$keychain"
+            echo "CSC_NAME=${identity#Developer ID Application: }"
+          } >> "$GITHUB_ENV"
+
+      - name: Package installer
+        shell: bash
+        env:
+          # Pull-request and manual artifact builds stay unsigned. Tagged macOS
+          # release builds sign + notarize when the Apple secrets are configured
+          # (so the downloaded DMG opens without Gatekeeper's "damaged" quarantine
+          # block) and fall back to an unsigned DMG when they aren't.
+          #
+          # Notarization goes through the App Store Connect API key, not an
+          # app-specific password. electron-builder checks APPLE_ID FIRST and
+          # returns as soon as it is set, so leaving that pair configured would
+          # silently shadow the API key — the two cannot coexist. The API key
+          # also does not expire the way an app-specific password does.
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/') && steps.maccreds.outputs.signed == 'true' && 'true' || 'false' }}
+          # No CSC_LINK / CSC_KEY_PASSWORD: the step above imported the
+          # certificate into a keychain of our own and exported CSC_KEYCHAIN +
+          # CSC_NAME through $GITHUB_ENV. Setting CSC_LINK here would send
+          # electron-builder back down its own temp-keychain path.
+          # APPLE_API_KEY is deliberately absent here: the step above exports the
+          # on-disk key path through $GITHUB_ENV, and a step-level `env:` entry
+          # would override it with the raw PEM text.
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_KEYCHAIN: ${{ secrets.APPLE_KEYCHAIN }}
+          APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
+        run: |
+          set -e
+          # Unconfigured secrets arrive as EMPTY env vars, and electron-builder
+          # treats a present-but-empty CSC_LINK as a certificate path — failing
+          # with "<dir> not a file" on any non-PR build (PR builds never hit it
+          # because electron-builder skips signing for pull requests). Drop empty
+          # signing vars so unsigned builds actually build unsigned.
+          for v in CSC_KEYCHAIN CSC_NAME APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_TEAM_ID APPLE_KEYCHAIN APPLE_KEYCHAIN_PROFILE; do
+            if [ -z "${!v:-}" ]; then unset "$v"; fi
+          done
+          # Run electron-builder with desktop/ as its own project root. Invoked
+          # from the monorepo root (e.g. via `npm --prefix desktop run`), it walks
+          # up, treats the repo root as the project, and on Windows pulls parent
+          # files (.dockerignore, .env.example, …) into the asar — failing with
+          # "<file> must be under …/desktop/". Running from desktop/ and hiding the
+          # root package.json (whose `workspaces` field triggers the upward scan)
+          # makes desktop/ the detected project root.
+          mv package.json "$RUNNER_TEMP/root-package.json"
+          cd desktop
+          # --publish never: the publish provider in electron-builder.yml exists
+          # so latest*.yml update metadata gets GENERATED, not so electron-builder
+          # uploads. The "Attach installer to release" step below owns publishing.
+          npx --no-install electron-builder ${{ matrix.ebArgs }} --publish never
+
+      - name: Smoke-test packaged macOS backend
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          app_dir=desktop/dist-electron/mac
+          if [ "$EXPECTED_ARCH" = arm64 ]; then app_dir="$app_dir-arm64"; fi
+          app="$app_dir/FreeLLMAPI.app"
+          ELECTRON_RUN_AS_NODE=1 "$app/Contents/MacOS/FreeLLMAPI" \
+            desktop/scripts/smoke-mac-package.mjs "$app" "$EXPECTED_ARCH"
+
+      # electron-builder notarizes and staples the .app, then wraps it in a DMG
+      # it never submits. The DMG is the file users download, so it is the file
+      # macOS quarantines and assesses — until it carries its own stapled
+      # ticket, `spctl -t install` on the download reports "no usable
+      # signature", which is #373's "damaged" block. The .app is signed inside
+      # the build (dmg.sign in electron-builder.yml makes the DMG eligible to
+      # submit); this finishes the job for the container.
+      - name: Notarize and staple the DMG
+        if: steps.maccreds.outputs.signed == 'true' && steps.maccreds.outputs.apikey == 'true'
+        shell: bash
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(desktop/dist-electron/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "::error::signing was enabled but electron-builder produced no DMG"
+            exit 1
+          fi
+          # app-builder ships the blockmap generator electron-builder itself uses.
+          app_builder=$(cd desktop && node -p "require('app-builder-bin').appBuilderPath")
+          for dmg in "${dmgs[@]}"; do
+            echo "== notarizing $(basename "$dmg") =="
+            # --wait turns a rejection into a non-zero exit, so a failed
+            # notarization fails the release instead of publishing a blocked DMG.
+            xcrun notarytool submit "$dmg" \
+              --key "$APPLE_API_KEY" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              --wait --timeout 30m
+            # Stapling fetches the ticket from Apple's CloudKit, and the Intel
+            # runners regularly lose that connection mid-request (error 68,
+            # "The network connection was lost") right after Apple accepted
+            # the submission. The ticket is already issued at that point, so
+            # retrying with a short backoff is safe and is all it takes.
+            for attempt in 1 2 3 4 5; do
+              if xcrun stapler staple "$dmg" && xcrun stapler validate "$dmg"; then
+                break
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                echo "::error::stapling $(basename "$dmg") failed after $attempt attempts"
+                exit 1
+              fi
+              echo "::warning::stapling attempt $attempt failed, retrying in $((attempt * 20))s"
+              sleep $((attempt * 20))
+            done
+            # The verdict Gatekeeper will give the download.
+            spctl -a -vv -t install "$dmg"
+            # Stapling rewrites the DMG in place, so the size, hash and blockmap
+            # electron-builder computed a moment ago no longer describe it.
+            # electron-updater verifies that hash, so leaving it stale would
+            # break updates for every installed copy.
+            node desktop/scripts/refresh-mac-update-metadata.mjs \
+              "$dmg" desktop/dist-electron/latest-mac.yml
+            "$app_builder" blockmap --input "$dmg" --output "$dmg.blockmap" --compression gzip
+          done
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.glob }}
+          if-no-files-found: error
+
+      # Upload the assets and nothing else. softprops/action-gh-release always
+      # PATCHes the release (name, body, draft state, target commitish) before it
+      # uploads, and that PATCH started coming back
+      # "403 Resource not accessible by integration" on the v0.9.6 rebuilds —
+      # every platform, while `GITHUB_TOKEN Permissions` in the same logs read
+      # `Contents: write` and the release was not immutable. Asset upload itself
+      # has never been refused: it is what attached the v0.9.6 Windows and Linux
+      # installers. So upload directly and leave the release metadata, which this
+      # job has no business rewriting, exactly as the release author left it.
+      - name: Attach installer to release
+        # The macOS finalizer uploads both architectures and ONE manifest.
+        if: runner.os != 'macOS' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GLOB: ${{ matrix.glob }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=()
+          while IFS= read -r pattern; do
+            [ -n "$pattern" ] || continue
+            files+=($pattern)
+          done <<< "$GLOB"
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no installers matched the patterns for this platform"
+            exit 1
+          fi
+          printf 'attaching %s\n' "${files[@]}"
+          # The release is created before the tag is pushed (see the release
+          # recipe), so it exists by now; create it rather than dropping the
+          # installers on the floor if someone pushed a tag on its own.
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::warning::no release for $GITHUB_REF_NAME yet — creating a draft"
+            gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+
+  macos-release:
+    name: Verify and combine macOS artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '20'
+      - name: Install metadata tooling
+        run: npm --prefix desktop ci --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: macos-installer-*
+          path: artifacts
+      - name: Verify artifacts and merge update metadata
+        run: |
+          node desktop/scripts/merge-mac-update-metadata.mjs \
+            artifacts/macos-installer-arm64 artifacts/macos-installer-x64 \
+            artifacts/latest-mac.yml
+      - name: Upload combined update metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-update-metadata
+          path: artifacts/latest-mac.yml
+          if-no-files-found: error
+      - name: Attach both macOS installers to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          # Upload payloads first, then the manifest that advertises them.
+          gh release upload "$GITHUB_REF_NAME" \
+            artifacts/macos-installer-*/*.dmg \
+            artifacts/macos-installer-*/*.zip \
+            artifacts/macos-installer-*/*.blockmap --clobber
+          gh release upload "$GITHUB_REF_NAME" artifacts/latest-mac.yml --clobber
+
+  # Only once every platform has attached its installers does the release go
+  # public. A release created published (the old recipe) is left alone.
+  publish:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, macos-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft once installers are attached
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"
+          count="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')"
+          echo "release $GITHUB_REF_NAME: draft=$draft assets=$count"
+          if [ "$count" -lt 5 ]; then
+            echo "::error::only $count asset(s) attached — not publishing"
+            exit 1
+          fi
+          if [ "$draft" = "true" ]; then
+            gh release edit "$GITHUB_REF_NAME" --draft=false
+            echo "published $GITHUB_REF_NAME"
+          else
+            echo "already published; nothing to do"
+          fi

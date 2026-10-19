@@ -1,43 +1,41 @@
 # ============================================================================
-# Credentials - NEVER commit any of these.
+# This repository is PRIVATE and DELIBERATELY contains live credentials:
 #
-# ops/freellmapi.config.json holds the dashboard admin password and the live
-# provider API keys. ops/secrets/ holds the ENCRYPTION_KEY (which also encrypts
-# database backups) and a copy of that password.
+#   ops/freellmapi.config.json   dashboard admin password + provider API keys
+#   ops/secrets/                 ENCRYPTION_KEY + dashboard password backup
+#   freellmapi/.env              ENCRYPTION_KEY (runtime env for the gateway)
 #
-# These live here, on disk, ACL-restricted to one user account. They are
-# supplied to Render through its secret prompt, never through Git.
+# Stated plainly, so this decision is not a surprise later:
+#
+#   Git history is permanent. If this repository is ever made public, or a
+#   collaborator is added, every one of those credentials is exposed, and
+#   deleting the file afterwards does NOT undo it - the values have to be
+#   ROTATED (new ENCRYPTION_KEY invalidates existing database backups; a new
+#   unified API key invalidates every client).
+#
+#   Keep it private. Render supplies its own copies through its secret prompt;
+#   these local files exist so the install is fully reproducible from a clone.
 # ============================================================================
-ops/freellmapi.config.json
-ops/secrets/
 
-# ============================================================================
-# The upstream FreeLLMAPI checkout (~448 MB, of which 361 MB is node_modules).
-#
-# It is a clone of a public project and has its own .git directory, so there is
-# nothing of ours to publish in it. It also contains .env (the encryption key)
-# and server/data/freeapi.db (the live database, including the unified API key).
-# ============================================================================
-freellmapi/
+# ---- dependencies and build output: never belongs in Git ------------------
+node_modules/
+**/node_modules/
+**/dist/
 
-# ============================================================================
-# Databases and backups
-# ============================================================================
+# ---- the upstream checkout's own git metadata -----------------------------
+# freellmapi/ is a clone of a public project and has its own .git directory
+# (26 MB). Its FILES are tracked here as ordinary files; its history is not.
+freellmapi/.git/
+
+# ---- live databases and backup blobs --------------------------------------
+# Binary, constantly rewritten, and restorable from the encrypted backup that
+# the gateway uploads. Push one deliberately if you ever need to.
 *.db
 *.db-wal
 *.db-shm
 *.backup
 
-# ============================================================================
-# Environment files, wherever they appear
-# ============================================================================
-.env
-*.env
-!.env.example
-
-# ============================================================================
-# Local scratch output
-# ============================================================================
+# ---- local scratch output -------------------------------------------------
 *.out
 *.err
 *.log

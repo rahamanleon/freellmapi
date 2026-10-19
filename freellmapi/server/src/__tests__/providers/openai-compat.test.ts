@@ -1,0 +1,1281 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import dns from 'node:dns';
+import { OpenAICompatProvider, inBandCreditsError } from '../../providers/openai-compat.js';
+
+describe('OpenAICompatProvider', () => {
+  let provider: OpenAICompatProvider;
+
+  beforeEach(() => {
+    provider = new OpenAICompatProvider({
+      platform: 'groq',
+      name: 'TestProvider',
+      baseUrl: 'https://api.test.com/v1',
+      extraHeaders: { 'X-Custom': 'test' },
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function sseResponse(frames: string[]): any {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+    return { ok: true, body: stream, headers: new Headers() };
+  }
+
+  async function collect<T>(gen: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const chunk of gen) out.push(chunk);
+    return out;
+  }
+
+  it('should set platform and name from config', () => {
+    expect(provider.platform).toBe('groq');
+    expect(provider.name).toBe('TestProvider');
+  });
+
+  it('should call API with correct URL and headers', async () => {
+    let capturedUrl = '';
+    let capturedHeaders: Record<string, string> = {};
+    let capturedBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = url as string;
+      capturedHeaders = (init as any).headers;
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'test-id',
+          object: 'chat.completion',
+          created: 123,
+          model: 'test-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    await provider.chatCompletion('my-key', [{ role: 'user', content: 'test' }], 'test-model');
+
+    expect(capturedUrl).toBe('https://api.test.com/v1/chat/completions');
+    expect(capturedHeaders['Authorization']).toBe('Bearer my-key');
+    expect(capturedHeaders['X-Custom']).toBe('test');
+    expect(capturedBody.messages[0].role).toBe('user');
+  });
+
+  describe('Moonshot assistant `partial` prefill flag (#1038)', () => {
+    beforeEach(() => {
+      // The custom-platform SSRF guard resolves public hosts before every
+      // request; answer with a public address so no real DNS is needed.
+      vi.spyOn(dns.promises, 'lookup').mockResolvedValue([{ address: '203.0.113.10', family: 4 }] as any);
+    });
+    function captureBody(): { body: () => any } {
+      let captured: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        captured = JSON.parse((init as any).body);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'test-id',
+            object: 'chat.completion',
+            created: 123,
+            model: 'test-model',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        } as any;
+      });
+      return { body: () => captured };
+    }
+    const prefill: any = { role: 'assistant', content: 'continue this', partial: true };
+    const custom = (baseUrl: string) => new OpenAICompatProvider({ platform: 'custom', name: 'Custom', baseUrl });
+
+    it('forwards `partial` to a custom endpoint on a Moonshot host', async () => {
+      const captured = captureBody();
+      await custom('https://api.moonshot.ai/v1').chatCompletion('k', [prefill], 'kimi-k2-0905-preview');
+      expect(captured.body().messages[0].partial).toBe(true);
+
+      await custom('https://api.moonshot.cn/v1').chatCompletion('k', [prefill], 'moonshot-v1-8k');
+      expect(captured.body().messages[0].partial).toBe(true);
+
+      await custom('https://api.kimi.com/coding/v1').chatCompletion('k', [prefill], 'kimi-for-coding');
+      expect(captured.body().messages[0].partial).toBe(true);
+    });
+
+    it('strips `partial` for a custom endpoint on any other host, even for a Kimi model id', async () => {
+      const captured = captureBody();
+      await custom('http://127.0.0.1:11434/v1').chatCompletion('k', [prefill], 'kimi-k2:1t-cloud');
+      expect(captured.body().messages[0]).not.toHaveProperty('partial');
+      expect(captured.body().messages[0].content).toBe('continue this');
+
+      // A look-alike host is not Moonshot.
+      await custom('https://moonshot.ai.example.com/v1').chatCompletion('k', [prefill], 'kimi-latest');
+      expect(captured.body().messages[0]).not.toHaveProperty('partial');
+    });
+
+    it('strips `partial` on Groq even when the model id is a Kimi model', async () => {
+      const captured = captureBody();
+      const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+      await groq.chatCompletion('k', [prefill], 'moonshotai/kimi-k2-instruct-0905');
+      expect(captured.body().messages[0]).not.toHaveProperty('partial');
+      expect(captured.body().messages[0].content).toBe('continue this');
+    });
+
+    it('strips `partial` on a non-strict built-in gateway that serves Kimi models', async () => {
+      const captured = captureBody();
+      const openrouter = new OpenAICompatProvider({ platform: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' });
+      await openrouter.chatCompletion('k', [
+        { role: 'user', content: 'hi' },
+        { ...prefill, reasoning_content: 'kept: only partial is Moonshot-private' },
+      ], 'moonshotai/kimi-k2:free');
+      const msgs = captured.body().messages;
+      expect(msgs[1]).not.toHaveProperty('partial');
+      expect(msgs[1].reasoning_content).toBe('kept: only partial is Moonshot-private');
+      expect(msgs[0]).toEqual({ role: 'user', content: 'hi' });
+    });
+
+    it('also strips `partial` on the streaming path for non-Moonshot endpoints', async () => {
+      let captured: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        captured = JSON.parse((init as any).body);
+        return sseResponse(['data: [DONE]\n\n']);
+      });
+      await collect(custom('http://127.0.0.1:1234/v1').streamChatCompletion('k', [prefill], 'kimi-latest'));
+      expect(captured.messages[0]).not.toHaveProperty('partial');
+
+      await collect(custom('https://api.moonshot.ai/v1').streamChatCompletion('k', [prefill], 'kimi-latest'));
+      expect(captured.messages[0].partial).toBe(true);
+    });
+  });
+
+  it('uses a 60s chat timeout by default for OpenAI-compatible providers (#530)', async () => {
+    const delays: number[] = [];
+    const origSetTimeout = global.setTimeout;
+    vi.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return origSetTimeout(fn, ms);
+    }) as typeof setTimeout);
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'test-id',
+        object: 'chat.completion',
+        created: 123,
+        model: 'test-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    await provider.chatCompletion('my-key', [{ role: 'user', content: 'test' }], 'test-model');
+
+    expect(delays).toContain(60_000);
+    expect(delays).not.toContain(15_000);
+  });
+
+  it('honors CompletionOptions.timeoutMs for OpenAI-compatible streams (#530)', async () => {
+    const delays: number[] = [];
+    const origSetTimeout = global.setTimeout;
+    vi.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return origSetTimeout(fn, ms);
+    }) as typeof setTimeout);
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(sseResponse([
+      'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n',
+      'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]));
+
+    const chunks = await collect(provider.streamChatCompletion(
+      'my-key',
+      [{ role: 'user', content: 'test' }],
+      'test-model',
+      { timeoutMs: 12_345 },
+    ));
+
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(delays).toContain(12_345);
+    expect(delays).not.toContain(60_000);
+    expect(delays).not.toContain(15_000);
+  });
+
+  it('should pass tool-calling params through untouched', async () => {
+    let capturedBody: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'test-id',
+          object: 'chat.completion',
+          created: 123,
+          model: 'test-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [] }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    await provider.chatCompletion(
+      'my-key',
+      [{ role: 'user', content: 'what is weather?' }],
+      'test-model',
+      {
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Get weather',
+            parameters: {
+              type: 'object',
+              properties: { city: { type: 'string' } },
+              required: ['city'],
+            },
+          },
+        }],
+        tool_choice: 'required',
+        parallel_tool_calls: true,
+      },
+    );
+
+    expect(capturedBody.tools).toHaveLength(1);
+    expect(capturedBody.tool_choice).toBe('required');
+    expect(capturedBody.parallel_tool_calls).toBe(true);
+  });
+
+  describe('forceSingleToolCall (NVIDIA NIM single-tool-call 400 — issue #255)', () => {
+    const nim = () => new OpenAICompatProvider({
+      platform: 'nvidia',
+      name: 'NVIDIA NIM',
+      baseUrl: 'https://integrate.api.nvidia.com/v1',
+      forceSingleToolCall: true,
+    });
+    const okResponse = {
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any;
+    const tools = [{ type: 'function' as const, function: { name: 'f', description: 'd', parameters: { type: 'object', properties: {} } } }];
+
+    it('pins parallel_tool_calls to false when tools are present, even if the caller asked for true', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm', { tools, parallel_tool_calls: true });
+      expect(body.parallel_tool_calls).toBe(false);
+    });
+
+    it('leaves parallel_tool_calls untouched when there are no tools', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm', {});
+      expect(body.parallel_tool_calls).toBeUndefined();
+    });
+
+    it('does not affect providers without the flag (parallel_tool_calls passes through)', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm', { tools, parallel_tool_calls: true });
+      expect(body.parallel_tool_calls).toBe(true);
+    });
+  });
+
+  it('should throw on error response', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 429,
+      statusText: 'Rate Limited',
+      json: () => Promise.resolve({ error: { message: 'Too many requests' } }),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/Too many requests/);
+  });
+
+  it('explains a non-JSON 200 body instead of surfacing the raw parse error (#189)', async () => {
+    // e.g. a custom base URL pointing at Ollama's native NDJSON /api endpoint:
+    // real fetch's res.json() rejects with "Unexpected non-whitespace character
+    // after JSON at position …", which is useless to the user.
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 583 (line 27 column 2)')),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/not OpenAI-compatible/);
+  });
+
+  it('distinguishes a truncated 200 body (CDN keepalive) from a wrong-endpoint 200 body (#430)', async () => {
+    // Cloudflare-fronted free-tier upstreams (Kilo routing Nemotron / Poolside Laguna)
+    // deliver a partial JSON body when the 600s edge idle-keepalive fires mid-response.
+    // Node's JSON.parse surfaces that as "Unexpected end of JSON input" — different from
+    // the NDJSON / native-API case above. Operators were chasing a base-URL bug that
+    // didn't exist because both paths produced the same error string.
+    const headers = new Headers({ 'content-type': 'application/json' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers,
+      json: () => Promise.reject(new SyntaxError('Unexpected end of JSON input')),
+    } as any);
+
+    let caught: Error | null = null;
+    try {
+      await provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model');
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toMatch(/truncated mid-stream/);
+    expect(caught!.message).toMatch(/Cloudflare's 600s edge limit/);
+    expect(caught!.message).not.toMatch(/not OpenAI-compatible/);
+  });
+
+  it('attributes an "after JSON at position" parse error with Content-Type: application/json to CDN truncation (#430)', async () => {
+    // Same edge-keepalive case but the body parses far enough to reach a
+    // mid-token garbage character before EOF. Content-Type is the only signal
+    // that distinguishes this from a real NDJSON upstream (next test).
+    const headers = new Headers({ 'content-type': 'application/json' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 4096 (line 1 column 4097)')),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/truncated mid-stream/);
+  });
+
+  it('does not flag NDJSON Content-Type as a truncation (#430 regression guard)', async () => {
+    // A real Ollama-style upstream announces NDJSON via Content-Type. Even if
+    // the parse error message happens to match the "after JSON at position"
+    // substring (NDJSON bodies do — the parser eats one object, then trips
+    // on the next one), we must not misclassify it as a CDN truncation.
+    const headers = new Headers({ 'content-type': 'application/x-ndjson' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 120 (line 3 column 1)')),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/not OpenAI-compatible/);
+  });
+
+  it('does not classify NDJSON Content-Type as a truncation — explicit not.toThrow (#430)', async () => {
+    // Companion to the previous test: explicitly assert the truncation message
+    // does NOT appear, so a future refactor can't silently switch the branch.
+    const headers = new Headers({ 'content-type': 'application/x-ndjson' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 120 (line 3 column 1)')),
+    } as any);
+
+    let caught: Error | null = null;
+    try {
+      await provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model');
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.message).not.toMatch(/truncated mid-stream/);
+    expect(caught!.message).toMatch(/not OpenAI-compatible/);
+  });
+
+  it('should validate key using models endpoint', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, status: 200 } as any);
+    expect(await provider.validateKey('valid')).toBe(true);
+  });
+
+  it('validateKey treats a 200 that is not JSON as an error, not a healthy key (#1557)', async () => {
+    // Retired GitHub Models answered every path with 200 "OK" in plain text.
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'text/plain' }),
+      text: () => Promise.resolve('OK\n'),
+    } as any);
+    await expect(provider.validateKey('any')).rejects.toThrow(/did not answer JSON/);
+  });
+
+  it('validateKey accepts a JSON model list', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      text: () => Promise.resolve('{"object":"list","data":[]}'),
+    } as any);
+    expect(await provider.validateKey('valid')).toBe(true);
+  });
+
+  it('validateKey preserves the provider reason on confirmed 401', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+      json: () => Promise.resolve({ error: { message: 'This token has expired' } }),
+    } as any);
+    expect(await provider.validateKey('bad')).toEqual({
+      valid: false,
+      error: 'TestProvider key validation failed (HTTP 401): This token has expired',
+    });
+  });
+
+  it('validateKey propagates transport errors instead of swallowing', async () => {
+    vi.spyOn(global, 'fetch').mockRejectedValueOnce(new Error('ECONNREFUSED'));
+    await expect(provider.validateKey('any')).rejects.toThrow(/ECONNREFUSED/);
+  });
+
+  it('folds reasoning_content into content when content is empty (Z.ai glm-4.5-flash style)', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'id', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: '', reasoning_content: 'the actual answer' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+    expect(result.choices[0].message.content).toBe('the actual answer');
+  });
+
+  it('flattens array content into a string (Mistral magistral style)', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'id', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: [{ type: 'text', text: 'part one ' }, { type: 'text', text: 'part two' }] },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+    expect(result.choices[0].message.content).toBe('part one part two');
+  });
+
+  it('strips internal reasoning/thought fields before sending messages to Mistral (#530)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    const mistral = new OpenAICompatProvider({ platform: 'mistral', name: 'Mistral', baseUrl: 'https://api.mistral.ai/v1' });
+    await mistral.chatCompletion(
+      'k',
+      [{
+        role: 'assistant',
+        content: null,
+        reasoning_content: 'private chain',
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'lookup', arguments: '{}' },
+          thought_signature: 'google-private-signature',
+        }],
+      }],
+      'mistral-medium-3',
+    );
+
+    expect(body.messages[0]).not.toHaveProperty('reasoning_content');
+    expect(body.messages[0].tool_calls[0]).not.toHaveProperty('thought_signature');
+    expect(body.messages[0].tool_calls[0]).toEqual({
+      id: 'call_1',
+      type: 'function',
+      function: { name: 'lookup', arguments: '{}' },
+    });
+  });
+
+  it('strips assistant reasoning_content before sending messages to Groq (#1070)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+    await groq.chatCompletion(
+      'k',
+      [{
+        role: 'assistant',
+        content: 'replayed turn',
+        reasoning_content: 'private chain from a prior thinking turn',
+      }],
+      'llama-3.3-70b-versatile',
+    );
+
+    // Groq is strict about unknown fields: reasoning_content must NOT reach the wire.
+    expect(body.messages[0]).not.toHaveProperty('reasoning_content');
+    expect(body.messages[0]).toEqual({ role: 'assistant', content: 'replayed turn' });
+  });
+
+  it('strips assistant reasoning_content before sending messages to Cerebras (#1070)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    const cerebras = new OpenAICompatProvider({ platform: 'cerebras', name: 'Cerebras', baseUrl: 'https://api.cerebras.ai/v1' });
+    await cerebras.chatCompletion(
+      'k',
+      [{
+        role: 'assistant',
+        content: 'replayed turn',
+        reasoning_content: 'private chain from a prior thinking turn',
+      }],
+      'zai-glm-4.7',
+    );
+
+    // Cerebras is strict about unknown fields: reasoning_content must NOT reach
+    // the wire (verified: 400 wrong_api_format 'property ... reasoning_content
+    // is unsupported', see vercel/ai#15042 / opencode#26762).
+    expect(body.messages[0]).not.toHaveProperty('reasoning_content');
+    expect(body.messages[0]).toEqual({ role: 'assistant', content: 'replayed turn' });
+  });
+
+  it('folds reasoning into content when content is empty (Ollama style — bare `reasoning` field)', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'id', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: '', reasoning: 'ollama answer' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+    expect(result.choices[0].message.content).toBe('ollama answer');
+  });
+
+  it('prefers reasoning_content over reasoning when both are present', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'id', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: '', reasoning_content: 'preferred', reasoning: 'fallback' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+    expect(result.choices[0].message.content).toBe('preferred');
+  });
+
+  it('does NOT fold reasoning_content when tool_calls are present', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'id', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: null,
+            reasoning_content: 'I am thinking about the tool',
+            tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+    expect(result.choices[0].message.content).toBeNull();
+    expect(result.choices[0].message.tool_calls?.[0].function.name).toBe('get_weather');
+  });
+
+  it('leaves real string content untouched', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'id', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: 'normal answer', reasoning_content: 'should not override' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any);
+
+    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+    expect(result.choices[0].message.content).toBe('normal answer');
+  });
+});
+
+describe('OpenAICompatProvider - platform instances', () => {
+  // Mirrors the actual registrations in server/src/providers/index.ts.
+  // Update both when adding/removing a platform.
+  const platforms = [
+    { platform: 'groq',       name: 'Groq',          baseUrl: 'https://api.groq.com/openai/v1' },
+    { platform: 'cerebras',   name: 'Cerebras',      baseUrl: 'https://api.cerebras.ai/v1' },
+    { platform: 'bai',        name: 'B.AI',          baseUrl: 'https://api.b.ai/v1' },
+    { platform: 'anyapi',     name: 'AnyAPI',        baseUrl: 'https://api.anyapi.ai/v1' },
+    { platform: 'radeon',     name: 'AMD Radeon Cloud', baseUrl: 'https://developer.amd.com.cn/radeon/api/v1' },
+    { platform: 'nvidia',     name: 'NVIDIA NIM',    baseUrl: 'https://integrate.api.nvidia.com/v1' },
+    { platform: 'mistral',    name: 'Mistral',       baseUrl: 'https://api.mistral.ai/v1' },
+    { platform: 'openrouter', name: 'OpenRouter',    baseUrl: 'https://openrouter.ai/api/v1' },
+    { platform: 'github',     name: 'GitHub Models', baseUrl: 'https://models.github.ai/inference' },
+    // pollinations registers a PollinationsProvider subclass (custom
+    // validateKey, see providers/pollinations.test.ts) but chat routing is
+    // stock openai-compat.
+    { platform: 'pollinations', name: 'Pollinations', baseUrl: 'https://gen.pollinations.ai/v1' },
+    { platform: 'zhipu',      name: 'Zhipu AI',      baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
+    { platform: 'opencode',   name: 'OpenCode Zen',  baseUrl: 'https://opencode.ai/zen/v1' },
+    { platform: 'aion',       name: 'Aion Labs',     baseUrl: 'https://api.aionlabs.ai/v1' },
+    { platform: 'requesty',   name: 'Requesty',      baseUrl: 'https://router.requesty.ai/v1' },
+    { platform: 'navy',       name: 'NavyAI',        baseUrl: 'https://api.navy/v1' },
+    { platform: 'nara',       name: 'NaraRouter',    baseUrl: 'https://router.bynara.id/v1' },
+    { platform: 'sealion',    name: 'SEA-LION',      baseUrl: 'https://api.sea-lion.ai/v1' },
+    { platform: 'orcarouter', name: 'OrcaRouter',    baseUrl: 'https://api.orcarouter.ai/v1' },
+    // unorouter's /v1/models requires auth (401 without a key), so default
+    // key validation works — no validateUrl override, unlike xkiro.
+    { platform: 'unorouter', name: 'UnoRouter',      baseUrl: 'https://api.unorouter.com/v1' },
+    // xkiro validates against /v1/usage (its /v1/models is public — 200 with no
+    // key), so it carries a validateUrl; chat routing is stock openai-compat.
+    { platform: 'xkiro',      name: 'xKiro',         baseUrl: 'https://api.xkiro.com/v1' },
+    // modelscope registers a ModelScopeProvider subclass (custom validateKey,
+    // see providers/modelscope.test.ts) but chat routing is stock openai-compat.
+    { platform: 'modelscope', name: 'ModelScope',    baseUrl: 'https://api-inference.modelscope.cn/v1' },
+  ] as const;
+
+  for (const p of platforms) {
+    it(`${p.name} provider should make requests to ${p.baseUrl}`, async () => {
+      const provider = new OpenAICompatProvider(p as any);
+
+      let capturedUrl = '';
+      vi.spyOn(global, 'fetch').mockImplementation(async (url) => {
+        capturedUrl = url as string;
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'id', object: 'chat.completion', created: 1, model: 'm',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          }),
+        } as any;
+      });
+
+      const result = await provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model');
+      expect(capturedUrl).toContain(p.baseUrl);
+      expect(result._routed_via?.platform).toBe(p.platform);
+    });
+  }
+
+  it('omits greedy temperature=0 for Requesty Leanstral and supplies neutral top_p', async () => {
+    const provider = new OpenAICompatProvider({
+      platform: 'requesty',
+      name: 'Requesty',
+      baseUrl: 'https://router.requesty.ai/v1',
+    });
+    let body: Record<string, unknown> = {};
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse(String((init as RequestInit).body));
+      return {
+        ok: true,
+        headers: new Headers(),
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'mistral/leanstral-1-5',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    await provider.chatCompletion(
+      'key',
+      [{ role: 'user', content: 'hi' }],
+      'mistral/leanstral-1-5',
+      { temperature: 0 },
+    );
+
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBe(1);
+  });
+
+  // #264: Groq (and others) reject a model's inline tool-call dialect with a 400
+  // `tool_use_failed`, handing back the raw text in `error.failed_generation`.
+  // We rescue it into structured tool_calls instead of dead-ending the turn.
+  describe('tool_use_failed rescue (#264)', () => {
+    let provider: OpenAICompatProvider;
+    beforeEach(() => {
+      provider = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+    });
+    const tools = [{
+      type: 'function' as const,
+      function: { name: 'read', description: 'read a file', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } },
+    }];
+    const failBody = {
+      error: {
+        message: 'Failed to call a function. Please adjust your prompt. See \'failed_generation\' for more details.',
+        type: 'invalid_request_error',
+        code: 'tool_use_failed',
+        failed_generation: '<function=read={"file_path": "sample.txt"}</function>',
+      },
+    };
+
+    it('non-stream: rescues failed_generation into structured tool_calls', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: false, status: 400, statusText: 'Bad Request',
+        json: () => Promise.resolve(failBody),
+      } as any);
+
+      const r = await provider.chatCompletion('key', [{ role: 'user', content: 'read sample.txt' }], 'llama-3.3-70b-versatile', { tools, tool_choice: 'auto' });
+      expect(r.choices[0].finish_reason).toBe('tool_calls');
+      const tc = r.choices[0].message.tool_calls;
+      expect(tc?.length).toBe(1);
+      expect(tc![0].function.name).toBe('read');
+      expect(JSON.parse(tc![0].function.arguments)).toEqual({ file_path: 'sample.txt' });
+    });
+
+    it('stream: yields a synthesized tool_calls turn instead of throwing', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: false, status: 400, statusText: 'Bad Request',
+        json: () => Promise.resolve(failBody),
+      } as any);
+
+      const chunks: any[] = [];
+      for await (const c of provider.streamChatCompletion('key', [{ role: 'user', content: 'read sample.txt' }], 'llama-3.3-70b-versatile', { tools, tool_choice: 'auto' })) {
+        chunks.push(c);
+      }
+      const calls = chunks.flatMap(c => c.choices[0].delta.tool_calls ?? []);
+      expect(calls.length).toBe(1);
+      expect(calls[0].function.name).toBe('read');
+      expect(chunks.some(c => c.choices[0].finish_reason === 'tool_calls')).toBe(true);
+    });
+
+    // The rescue turns a provider 400 into a success. If what it recovered does
+    // not satisfy the tool's schema, that success is one the client cannot use —
+    // so with the opt-in verdict on, decline the rescue and let the original
+    // error propagate, exactly as it did before #264.
+    it('declines the rescue when the recovered arguments violate the schema', async () => {
+      process.env.VALIDATE_TOOL_ARGUMENTS = '1';
+      try {
+        vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+          ok: false, status: 400, statusText: 'Bad Request',
+          json: () => Promise.resolve({
+            ...failBody,
+            error: { ...failBody.error, failed_generation: '<function=read={"nope": "sample.txt"}</function>' },
+          }),
+        } as any);
+
+        await expect(
+          provider.chatCompletion('key', [{ role: 'user', content: 'read sample.txt' }], 'llama-3.3-70b-versatile', { tools, tool_choice: 'auto' }),
+        ).rejects.toThrow(/API error 400/);
+      } finally {
+        delete process.env.VALIDATE_TOOL_ARGUMENTS;
+      }
+    });
+
+    it('still rescues schema-valid arguments while the verdict is on', async () => {
+      process.env.VALIDATE_TOOL_ARGUMENTS = '1';
+      try {
+        vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+          ok: false, status: 400, statusText: 'Bad Request',
+          json: () => Promise.resolve(failBody),
+        } as any);
+
+        const r = await provider.chatCompletion('key', [{ role: 'user', content: 'read sample.txt' }], 'llama-3.3-70b-versatile', { tools, tool_choice: 'auto' });
+        expect(JSON.parse(r.choices[0].message.tool_calls![0].function.arguments)).toEqual({ file_path: 'sample.txt' });
+      } finally {
+        delete process.env.VALIDATE_TOOL_ARGUMENTS;
+      }
+    });
+
+    it('still throws when there is no failed_generation to rescue', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: false, status: 400, statusText: 'Bad Request',
+        json: () => Promise.resolve({ error: { message: 'bad request', code: 'invalid_request' } }),
+      } as any);
+      await expect(
+        provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'm', { tools }),
+      ).rejects.toThrow(/API error 400/);
+    });
+  });
+});
+
+describe('extended sampling param passthrough', () => {
+  const mockOk = () => ({
+    ok: true,
+    json: () => Promise.resolve({
+      id: 'x', object: 'chat.completion', created: 1, model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  }) as any;
+
+  const extended = {
+    seed: 42, top_k: 40, min_p: 0.05, presence_penalty: 0.5, frequency_penalty: -0.25,
+    logit_bias: { '50256': -100 }, logprobs: true, top_logprobs: 3,
+    response_format: { type: 'json_schema' as const, json_schema: { name: 'a', schema: { type: 'object' } } },
+  };
+
+  it('forwards the full extended set for a policy-free platform', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk();
+    });
+    const p = new OpenAICompatProvider({ platform: 'cerebras', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', extended);
+
+    expect(body.seed).toBe(42);
+    expect(body.top_k).toBe(40);
+    expect(body.min_p).toBe(0.05);
+    expect(body.logit_bias).toEqual({ '50256': -100 });
+    expect(body.logprobs).toBe(true);
+    expect(body.top_logprobs).toBe(3);
+    expect(body.response_format.type).toBe('json_schema');
+  });
+
+  it('applies the mistral policy on the wire: random_seed rename, strict-API params dropped', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk();
+    });
+    const p = new OpenAICompatProvider({ platform: 'mistral', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', extended);
+
+    expect(body.random_seed).toBe(42);
+    expect(body).not.toHaveProperty('seed');
+    expect(body).not.toHaveProperty('top_k');
+    expect(body).not.toHaveProperty('logit_bias');
+    expect(body).not.toHaveProperty('logprobs');
+    expect(body.presence_penalty).toBe(0.5);
+    expect(body.response_format.type).toBe('json_schema');
+  });
+
+  it('sends no extended keys when none were requested (undefined stays omitted)', async () => {
+    let raw = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      raw = (init as any).body;
+      return mockOk();
+    });
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { temperature: 0.7 });
+
+    expect(raw).not.toContain('seed');
+    expect(raw).not.toContain('response_format');
+    expect(raw).not.toContain('logit_bias');
+  });
+});
+
+describe('reasoning: request knob + <think> extraction (P2 #16)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const mockOk = (content: string, extra: Record<string, unknown> = {}) => ({
+    ok: true,
+    json: () => Promise.resolve({
+      id: 'x', object: 'chat.completion', created: 1, model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content, ...extra }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  }) as any;
+
+  function sse(frames: string[]): any {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const f of frames) controller.enqueue(encoder.encode(f));
+        controller.close();
+      },
+    });
+    return { ok: true, body: stream, headers: new Headers() };
+  }
+
+  async function collect<T>(g: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const c of g) out.push(c);
+    return out;
+  }
+
+  const dataFrame = (delta: Record<string, unknown>, finish: string | null = null) =>
+    `data: ${JSON.stringify({ id: 's1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+
+  it('forwards reasoning_effort on the wire for a supporting platform', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { reasoning_effort: 'low' });
+    expect(body.reasoning_effort).toBe('low');
+  });
+
+  it('strips reasoning_effort for a platform whose policy drops it (mistral)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'mistral', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { reasoning_effort: 'high' });
+    expect(body).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('sends nothing reasoning-related when the knob is absent (default unchanged)', async () => {
+    let raw = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      raw = (init as any).body;
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { temperature: 0 });
+    expect(raw).not.toContain('reasoning');
+  });
+
+  it('non-streaming: a leading <think> block moves into reasoning_content', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('<think>chain of thought</think>The answer is 4.'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: '2+2?' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('The answer is 4.');
+    expect(msg.reasoning_content).toBe('chain of thought');
+  });
+
+  it('non-streaming: a think-only message still folds back into content (never empty)', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('<think>all reasoning, no answer</think>'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('all reasoning, no answer');
+    expect(msg.reasoning_content).toBe('all reasoning, no answer');
+  });
+
+  it('non-streaming: tag-free content is untouched', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('plain answer'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('plain answer');
+    expect(msg.reasoning_content).toBeUndefined();
+  });
+
+  it('streaming: think content becomes delta.reasoning_content even when the tags split across chunks', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: '<thi' }),
+      dataFrame({ content: 'nk>step one, ' }),
+      dataFrame({ content: 'step two</th' }),
+      dataFrame({ content: 'ink>Final answer' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    const reasoning = chunks.map(c => (c.choices?.[0]?.delta as any)?.reasoning_content ?? '').join('');
+    const content = chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('');
+    expect(reasoning).toBe('step one, step two');
+    expect(content).toBe('Final answer');
+  });
+
+  it('streaming: an unclosed <think> at stream end flushes as reasoning, losing no text', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ content: '<think>truncated thought</thi' }),
+      dataFrame({}, 'length'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    const reasoning = chunks.map(c => (c.choices?.[0]?.delta as any)?.reasoning_content ?? '').join('');
+    const content = chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('');
+    expect(reasoning).toBe('truncated thought</thi');
+    expect(content).toBe('');
+  });
+
+  it('streaming: a tag-free stream is byte-identical (no synthetic frames, no reasoning)', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: 'Hello ' }),
+      dataFrame({ content: 'world' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    expect(chunks).toHaveLength(4);
+    expect(chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('')).toBe('Hello world');
+    expect(chunks.some(c => (c.choices?.[0]?.delta as any)?.reasoning_content != null)).toBe(false);
+  });
+});
+
+describe('OpenAICompatProvider in-band out-of-credits notice (#pollinations-inband)', () => {
+  // The canned Pollinations top-up message returned as a 200 body.
+  const CREDITS = "The account behind this API key doesn't have enough credits. " +
+    'Please top up (https://enter.pollinations.ai/top-up?ref=agent_low_balance_topup) or ' +
+    'complete a quest (https://enter.pollinations.ai/quests?ref=agent_low_balance_quests), then try again.';
+
+  afterEach(() => vi.restoreAllMocks());
+
+  const provider = () => new OpenAICompatProvider({ platform: 'groq', name: 'Pollinations', baseUrl: 'https://x/v1' });
+
+  function sse(frames: string[]): any {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const f of frames) controller.enqueue(encoder.encode(f));
+        controller.close();
+      },
+    });
+    return { ok: true, body: stream, headers: new Headers() };
+  }
+  const dataFrame = (delta: Record<string, unknown>, finish: string | null = null) =>
+    `data: ${JSON.stringify({ id: 's1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+  async function collect<T>(g: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const c of g) out.push(c);
+    return out;
+  }
+
+  describe('inBandCreditsError', () => {
+    it('flags the Pollinations notice and a truncated prefix of it', () => {
+      expect(inBandCreditsError(CREDITS)).toBeTruthy();
+      expect(inBandCreditsError("doesn't have enough credits. Please top up")).toBeTruthy();
+    });
+    it('does not flag a genuine reply that merely mentions credits', () => {
+      expect(inBandCreditsError("You don't need enough credits upfront — just enable billing.")).toBeNull();
+      expect(inBandCreditsError('Here is a poem about the ocean.')).toBeNull();
+      expect(inBandCreditsError('')).toBeNull();
+      expect(inBandCreditsError(undefined)).toBeNull();
+    });
+  });
+
+  it('non-stream: throws a payment-required error instead of returning the notice', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      headers: new Headers(),
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: CREDITS }, finish_reason: 'stop' }],
+      }),
+    }) as any);
+    await expect(provider().chatCompletion('k', [{ role: 'user', content: 'q' }], 'm'))
+      .rejects.toThrow(/402|insufficient credit/i);
+  });
+
+  it('non-stream: a normal reply is returned unchanged', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      headers: new Headers(),
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hello there' }, finish_reason: 'stop' }],
+      }),
+    }) as any);
+    const res = await provider().chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    expect(res.choices[0].message.content).toBe('hello there');
+  });
+
+  it('stream: throws before yielding any chunk when the body is a credits notice', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: CREDITS }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    await expect(collect(provider().streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm')))
+      .rejects.toThrow(/402|insufficient credit/i);
+  });
+
+  it('stream: a normal reply passes through unchanged', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: 'Hello ' }),
+      dataFrame({ content: 'world' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const chunks = await collect(provider().streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    expect(chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('')).toBe('Hello world');
+  });
+});
+
+describe('pinned tool_choice retry on custom endpoints (#1548)', () => {
+  const custom = () => new OpenAICompatProvider({ platform: 'custom', name: 'Custom', baseUrl: 'http://127.0.0.1:1234/v1' });
+  const moveNote = { type: 'function' as const, function: { name: 'move_note', description: 'Move a note', parameters: { type: 'object', properties: { folder: { type: 'string' } }, required: ['folder'] } } };
+  const tagNote = { type: 'function' as const, function: { name: 'tag_note', description: 'Tag a note', parameters: { type: 'object', properties: { tag: { type: 'string' } } } } };
+  const pinned = { type: 'function' as const, function: { name: 'move_note' } };
+  const messages = [{ role: 'user' as const, content: 'File this note under Finance.' }];
+  const badRequest = () => ({ ok: false, status: 400, statusText: 'Bad Request', json: () => Promise.resolve({}) }) as any;
+  const toolCallResponse = () => ({
+    ok: true,
+    json: () => Promise.resolve({
+      id: 'x', object: 'chat.completion', created: 1, model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'move_note', arguments: '{"folder":"Finance"}' } }] }, finish_reason: 'tool_calls' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  }) as any;
+  const toolCallStream = () => {
+    const frames = [
+      'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"move_note","arguments":"{\\"folder\\":\\"Finance\\"}"}}]},"finish_reason":null}]}\n\n',
+      'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+    return { ok: true, status: 200, body, headers: new Headers() } as any;
+  };
+
+  /** Answer each request with the next response and record every request body. */
+  function upstream(...responses: Array<() => any>) {
+    const bodies: any[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+      bodies.push(JSON.parse((init as any).body));
+      const next = responses[bodies.length - 1];
+      if (!next) throw new Error(`unexpected request #${bodies.length}`);
+      return next();
+    });
+    return bodies;
+  }
+
+  let log: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('sends the object form first and does not retry when the endpoint accepts it', async () => {
+    const bodies = upstream(toolCallResponse);
+    const r = await custom().chatCompletion('k', messages, 'm', { tools: [moveNote, tagNote], tool_choice: pinned });
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].tool_choice).toEqual(pinned);
+    expect(bodies[0].tools).toEqual([moveNote, tagNote]);
+    expect(r.choices[0].message.tool_calls?.[0].function.name).toBe('move_note');
+  });
+
+  it('non-stream: retries a 400 once with "required" over only the pinned tool', async () => {
+    const bodies = upstream(badRequest, toolCallResponse);
+    const r = await custom().chatCompletion('k', messages, 'm', { tools: [moveNote, tagNote], tool_choice: pinned, max_tokens: 300 });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1].tool_choice).toBe('required');
+    expect(bodies[1].tools).toEqual([moveNote]);
+    expect(bodies[1].messages).toEqual(bodies[0].messages);
+    expect(bodies[1].max_tokens).toBe(bodies[0].max_tokens);
+    expect(r.choices[0].message.tool_calls?.[0].function).toEqual({ name: 'move_note', arguments: '{"folder":"Finance"}' });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('#1548'));
+  });
+
+  it('stream: retries a 400 once with "required" over only the pinned tool', async () => {
+    const bodies = upstream(badRequest, toolCallStream);
+    const chunks: any[] = [];
+    for await (const c of custom().streamChatCompletion('k', messages, 'm', { tools: [moveNote, tagNote], tool_choice: pinned })) chunks.push(c);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].tool_choice).toEqual(pinned);
+    expect(bodies[1].tool_choice).toBe('required');
+    expect(bodies[1].tools).toEqual([moveNote]);
+    expect(bodies[1].stream).toBe(true);
+    const calls = chunks.flatMap(c => c.choices[0]?.delta?.tool_calls ?? []);
+    expect(calls[0].function.name).toBe('move_note');
+  });
+
+  const rejected = (message: string) => () => ({ ok: false, status: 400, statusText: 'Bad Request', json: () => Promise.resolve({ error: { message } }) }) as any;
+
+  it('non-stream: throws the retry error when the rewritten request is rejected too, without a third attempt', async () => {
+    const bodies = upstream(rejected('first rejection'), rejected('retry rejection'));
+    await expect(custom().chatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: pinned })).rejects.toThrow('Custom API error 400: retry rejection');
+    expect(bodies).toHaveLength(2);
+  });
+
+  it('stream: throws the retry error when the rewritten request is rejected too, without a third attempt', async () => {
+    const bodies = upstream(rejected('first rejection'), rejected('retry rejection'));
+    const drain = async () => {
+      for await (const _ of custom().streamChatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: pinned })) { /* drain */ }
+    };
+    await expect(drain()).rejects.toThrow('Custom API error 400: retry rejection');
+    expect(bodies).toHaveLength(2);
+  });
+
+  it('does not retry when tool_choice is already a string', async () => {
+    const bodies = upstream(badRequest);
+    await expect(custom().chatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: 'required' })).rejects.toThrow('Custom API error 400');
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('does not retry when the pinned function is not among the tools', async () => {
+    const bodies = upstream(badRequest);
+    await expect(custom().chatCompletion('k', messages, 'm', { tools: [tagNote], tool_choice: pinned })).rejects.toThrow('Custom API error 400');
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('does not retry errors other than 400', async () => {
+    const bodies = upstream(() => ({ ok: false, status: 500, statusText: 'Internal Server Error', json: () => Promise.resolve({}) }) as any);
+    await expect(custom().chatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: pinned })).rejects.toThrow('Custom API error 500');
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('does not retry built-in platforms', async () => {
+    const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+    const bodies = upstream(badRequest);
+    await expect(groq.chatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: pinned })).rejects.toThrow('Groq API error 400');
+    expect(bodies).toHaveLength(1);
+  });
+});

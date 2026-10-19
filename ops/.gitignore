@@ -1,13 +1,7 @@
-# Never commit credentials.
+# This repository is PRIVATE and deliberately tracks the credentials in this
+# directory (freellmapi.config.json, secrets/). See the root .gitignore for the
+# consequences of doing so.
 #
-# ops/freellmapi.config.json contains the dashboard admin password and live
-# provider API keys, because that is the only declarative path FreeLLMAPI
-# supports for them.
-freellmapi.config.json
-
-# Encryption key, dashboard password, scratch databases and backup blobs.
-secrets/
-
-# Local scratch output from the durability test.
+# This file therefore only filters local scratch output.
 *.out
 *.err

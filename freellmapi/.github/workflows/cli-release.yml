@@ -1,0 +1,116 @@
+name: CLI release
+
+# Publishes the `freellmapi` CLI to npm. Closes #671 — the README and
+# docs/clients/01-agent-clients.md have always documented `npx freellmapi setup-claude`, but the
+# package was never pushed to the registry, so every one of those commands died
+# with npm E404.
+#
+# Triggers:
+#   - push to main touching cli/**   publish when cli/package.json's version is
+#                                    not on the registry yet; no-op otherwise
+#   - workflow_dispatch              manual run
+#
+# The version guard makes this idempotent: ordinary cli/src changes re-run the
+# job, see the version already published, and skip. To ship a new version, bump
+# `version` in cli/package.json in the PR that changes the code.
+#
+# Auth is npm trusted publishing (OIDC) — no NPM_TOKEN, no long-lived secret.
+# npm revoked all classic tokens in December 2025, and granular tokens with
+# "bypass 2FA" are being wound down through 2026 (they lose direct publish
+# around January 2027), so a token-based workflow would have been born
+# deprecated. OIDC mints a short-lived credential per job instead, and npm
+# attaches provenance automatically.
+#
+# One-time setup on npmjs.com (Package settings → Trusted Publisher):
+#   Organization or user: tashfeenahmed
+#   Repository:           freellmapi
+#   Workflow filename:    cli-release.yml
+# Trusted publishing cannot bootstrap a package that does not exist yet — npm
+# has no package settings page to configure until the first version is up — so
+# 0.3.0 was published manually. Every version after it goes through here.
+#
+# Requires npm >= 11.5.1 and Node >= 22.14.0 for OIDC, hence Node 24 below
+# (still inside the repo's engines range of >=20.18 <25).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'cli/**'
+      - '.github/workflows/cli-release.yml'
+
+permissions:
+  contents: read
+  id-token: write # OIDC credential for trusted publishing
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./cli/package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # `npm view` exits non-zero for an unpublished name/version; an empty
+          # result is the signal to publish, not an error.
+          PUBLISHED=$(npm view "freellmapi@$VERSION" version 2>/dev/null || true)
+          if [ -n "$PUBLISHED" ]; then
+            echo "freellmapi@$VERSION is already on the registry — nothing to do."
+            echo "should-publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "freellmapi@$VERSION is not published yet."
+            echo "should-publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # `npm publish` runs cli's prepublishOnly (build + test) as a safety net.
+      # Building here as well keeps a broken tsc from reaching the publish step.
+      - name: Build and test the CLI
+        if: steps.version.outputs.should-publish == 'true'
+        run: |
+          npm run build -w cli
+          npm run test -w cli
+
+      - name: Smoke-test the packed tarball
+        if: steps.version.outputs.should-publish == 'true'
+        run: |
+          set -euo pipefail
+          # Install what subscribers will actually download — catches a `files`
+          # array that omits a runtime import, which `npm test` cannot see.
+          TARBALL=$(cd cli && npm pack --silent --pack-destination "$RUNNER_TEMP")
+          WORKDIR="$RUNNER_TEMP/smoke"
+          mkdir -p "$WORKDIR" && cd "$WORKDIR"
+          npm init -y >/dev/null
+          npm install "$RUNNER_TEMP/$TARBALL" >/dev/null
+          npx freellmapi --help
+          npx freellmapi list >/dev/null
+
+      # No NODE_AUTH_TOKEN: the OIDC credential comes from id-token: write.
+      # Provenance is attached automatically under trusted publishing.
+      - name: Publish
+        if: steps.version.outputs.should-publish == 'true'
+        run: npm publish --access public -w cli
+
+      - name: Summary
+        if: always()
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          if [ "${{ steps.version.outputs.should-publish }}" = "true" ]; then
+            echo "Published freellmapi@$V" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "freellmapi@$V is already on the registry — skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi

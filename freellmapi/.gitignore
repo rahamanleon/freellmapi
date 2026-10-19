@@ -1,0 +1,27 @@
+node_modules/
+dist/
+server/data/
+# Runtime data dir when the server is launched from the repo root (same
+# contents as server/data — DB + keyfile — so same rule).
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.bak
+# Auto-generated dev encryption key (written next to the SQLite DB when
+# ENCRYPTION_KEY is unset outside production). Never commit it.
+.encryption-key
+.env
+.env.local
+/tunnel-client.yaml
+.DS_Store
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Personal deployment scripts (contain keys/credentials — kept local)
+deploy-pi.sh
+update-hermes.sh
+
+# Monetization planning — private, never committed
+monetization/

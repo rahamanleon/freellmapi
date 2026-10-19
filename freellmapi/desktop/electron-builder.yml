@@ -1,0 +1,97 @@
+appId: com.freellmapi.desktop
+productName: FreeLLMAPI
+directories:
+  output: dist-electron
+files:
+  - build/**/*
+  - renderer/**/*
+  - assets/**/*
+  - "!**/*.map"
+# Update metadata. With a publish provider configured, electron-builder emits
+# latest.yml / latest-mac.yml next to the installers — the manifest ANY updater
+# (electron-updater or otherwise) reads to learn what the newest version is and
+# where to fetch it. Releases up to v0.6.6 shipped installers only, so nothing
+# could tell an installed app that a newer one exists. Uploading stays OFF
+# (--publish never in the scripts and the workflow); the release workflow
+# attaches the files itself. See #703.
+publish:
+  provider: github
+  owner: tashfeenahmed
+  repo: freellmapi
+asar: true
+# Linux chrome-sandbox must be mode 4755 (setuid) in the .deb; otherwise
+# Electron aborts at launch (#1229). Path is relative to desktop/.
+afterPack: ./scripts/after-pack-linux-sandbox.mjs
+afterSign: ./scripts/after-sign-notarize.mjs
+asarUnpack:
+  - "**/node_modules/better-sqlite3/**/*.node"
+  - "**/node_modules/better-sqlite3/build/Release/**"
+# client-dist is staged into desktop/ by `npm run stage:client` (scripts/stage-client.mjs).
+# It MUST stay a path inside desktop/: a `../` source makes electron-builder treat the
+# repo root as a copy base and reject every root file ("must be under .../desktop/").
+extraResources:
+  - from: client-dist
+    to: client-dist
+mac:
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+  category: public.app-category.developer-tools
+  icon: assets/icon.icns
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: assets/entitlements.mac.plist
+  entitlementsInherit: assets/entitlements.mac.inherit.plist
+  # Notarization runs in afterSign (scripts/after-sign-notarize.mjs) rather
+  # than electron-builder's built-in step, which staples once and fails the
+  # whole build when Apple's ticket lookup drops the connection (v0.14.0/1).
+  notarize: false
+  # Select the architecture with --arm64 or --x64 in the build command.
+  # Per-target arch lists override that selection and make each CI job build
+  # both architectures, including the native SQLite module for the other CPU.
+  target:
+    - target: dmg
+    - target: zip
+  extendInfo:
+    LSUIElement: 1
+# The DMG is the file people actually download, so it is the file macOS
+# quarantines and assesses. electron-builder signs and notarizes the .app inside
+# but leaves the DMG itself unsigned, which leaves `spctl -t install` on the
+# download reporting "no usable signature" — #373's "damaged" report. Signing it
+# here is also what makes it *eligible* for notarization; the release workflow
+# submits and staples it afterwards. This runs before the blockmap and
+# latest-mac.yml are computed, so those describe the signed file.
+dmg:
+  sign: true
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: zip
+      arch:
+        - x64
+  # electron-builder converts a >=256px PNG to .ico at build time.
+  icon: assets/appicon_1024.png
+linux:
+  category: Development;Utility;
+  icon: assets/appicon_1024.png # electron-builder can automatically scale PNGs
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: tar.xz
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+    - target: rpm
+      arch:
+        - x64
+nsis:
+  # electron-builder's default NSIS name has spaces ("FreeLLMAPI Setup x.y.z.exe")
+  # and latest.yml records it with dashes, while GitHub stores the upload with
+  # dots — so the updater asked for a file the release did not have. A name with
+  # no spaces is the same string in all three places.
+  artifactName: "${productName}-Setup-${version}.${ext}"
+  oneClick: true
+  deleteAppDataOnUninstall: false

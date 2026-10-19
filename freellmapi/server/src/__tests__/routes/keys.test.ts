@@ -1,0 +1,606 @@
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import type { Express } from 'express';
+import { createApp } from '../../app.js';
+import { initDb, getDb } from '../../db/index.js';
+import { decrypt } from '../../lib/crypto.js';
+import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
+
+let dashToken = '';
+
+async function request(app: Express, method: string, path: string, body?: any) {
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
+  const addr = server.address() as any;
+  const url = `http://127.0.0.1:${addr.port}${path}`;
+
+  const res = await fetch(url, {
+    method,
+    headers: {
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+      ...(isGatedApiPath(path) ? { Authorization: `Bearer ${dashToken}` } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await res.json().catch(() => null);
+  server.close();
+  return { status: res.status, body: data };
+}
+
+async function multipartRequest(
+  app: Express,
+  path: string,
+  field: 'file' | 'files',
+  files: Array<{ filename: string; content: string; type?: string }>,
+) {
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
+  const addr = server.address() as any;
+  const url = `http://127.0.0.1:${addr.port}${path}`;
+  const form = new FormData();
+  for (const file of files) {
+    form.append(
+      field,
+      new Blob([file.content], { type: file.type ?? 'text/plain' }),
+      file.filename,
+    );
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      ...(isGatedApiPath(path) ? { Authorization: `Bearer ${dashToken}` } : {}),
+    },
+    body: form,
+  });
+
+  const data = await res.json().catch(() => null);
+  server.close();
+  return { status: res.status, body: data };
+}
+
+describe('Keys API', () => {
+  let app: Express;
+
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+    app = createApp();
+    dashToken = mintDashboardToken();
+  });
+
+  beforeEach(() => {
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+  });
+
+  it('GET /api/keys returns empty array initially', async () => {
+    const { status, body } = await request(app, 'GET', '/api/keys');
+    expect(status).toBe(200);
+    expect(body).toEqual([]);
+  });
+
+  it('POST /api/keys creates a new key', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+      label: 'My Groq Key',
+    });
+
+    expect(status).toBe(201);
+    expect(body.platform).toBe('groq');
+    expect(body.label).toBe('My Groq Key');
+    expect(body.maskedKey).toContain('...');
+  });
+
+  it('GET /api/keys returns the created key', async () => {
+    // First create a key
+    await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+
+    const { status, body } = await request(app, 'GET', '/api/keys');
+    expect(status).toBe(200);
+    expect(body).toHaveLength(1);
+    expect(body[0].platform).toBe('groq');
+  });
+
+  it('POST /api/keys warns when the platform has no catalog models yet (#438)', async () => {
+    const db = getDb();
+    // Simulate the Agnes case: a registered platform whose models aren't in
+    // this install's catalog tier. Force it by disabling every agnes row (a
+    // fresh migrated DB already has zero agnes models, but be explicit).
+    db.prepare("UPDATE models SET enabled = 0 WHERE platform = 'agnes'").run();
+
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'agnes',
+      key: 'agnes_test_key_123456',
+    });
+    expect(status).toBe(201);
+    expect(body.modelsAvailable).toBe(0);
+    expect(body.notice).toBeTruthy();
+    expect(body.notice).toMatch(/no agnes models/i);
+  });
+
+  it('#1327: the no-catalog notice names the provider base URL so the custom-provider workaround is actionable', async () => {
+    const db = getDb();
+    db.prepare("UPDATE models SET enabled = 0 WHERE platform = 'agnes'").run();
+
+    const { body } = await request(app, 'POST', '/api/keys', {
+      platform: 'agnes',
+      key: 'agnes_test_key_123456',
+    });
+    // Agnes is an OpenAI-compat provider: the notice must quote its actual
+    // base URL, which is what the workaround tells the user to paste.
+    expect(body.notice).toMatch(/base URL https:\/\/apihub\.agnes-ai\.com\/v1/);
+  });
+
+  it('#1327: a non-OpenAI-compat provider gets no bogus custom-provider advice', async () => {
+    const db = getDb();
+    db.prepare("DELETE FROM media_models WHERE platform = 'speechify'").run();
+    const { body } = await request(app, 'POST', '/api/keys', {
+      platform: 'speechify',
+      key: 'speechify_test_key_123456',
+    });
+    // Speechify speaks its own TTS API; suggesting the custom
+    // OpenAI-compatible path for it sends users into a dead end.
+    expect(body.notice).toMatch(/no speechify models/i);
+    expect(body.notice).not.toMatch(/custom OpenAI-compatible/);
+  });
+
+  it('#1327: a media-only provider whose TTS models are in the catalog gets no notice', async () => {
+    const db = getDb();
+    db.prepare("DELETE FROM media_models WHERE platform = 'speechify'").run();
+    db.prepare(`
+      INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled)
+      VALUES ('speechify', 'simba-english', 'Speechify Simba English', 'audio', 1, 1)
+    `).run();
+    try {
+      const { status, body } = await request(app, 'POST', '/api/keys', {
+        platform: 'speechify',
+        key: 'speechify_test_key_123456',
+      });
+      expect(status).toBe(201);
+      expect(body.modelsAvailable).toBe(1);
+      expect(body.notice).toBeUndefined();
+    } finally {
+      db.prepare("DELETE FROM media_models WHERE platform = 'speechify'").run();
+    }
+  });
+
+  it('#1327: a Premium install is not told to add a Premium license key', async () => {
+    const db = getDb();
+    db.prepare("UPDATE models SET enabled = 0 WHERE platform = 'agnes'").run();
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('catalog_applied_tier', 'live')").run();
+    try {
+      const { body } = await request(app, 'POST', '/api/keys', {
+        platform: 'agnes',
+        key: 'agnes_test_key_123456',
+      });
+      expect(body.notice).toMatch(/Premium catalog does not list any agnes models/);
+      expect(body.notice).not.toMatch(/Add a Premium license key/);
+      expect(body.notice).toMatch(/base URL https:\/\/apihub\.agnes-ai\.com\/v1/);
+    } finally {
+      db.prepare("DELETE FROM settings WHERE key = 'catalog_applied_tier'").run();
+    }
+  });
+
+  it('POST /api/keys does not warn when the platform has catalog models', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+    expect(status).toBe(201);
+    expect(body.modelsAvailable).toBeGreaterThan(0);
+    expect(body.notice ?? null).toBeNull();
+  });
+
+  it('POST /api/keys accepts the modelscope platform (#581)', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'modelscope',
+      key: 'ms-test-invalid-not-a-real-token',
+      label: 'ModelScope test',
+    });
+    expect(status).toBe(201);
+    expect(body.platform).toBe('modelscope');
+    // Catalog rows land only after community testing (#581), so a fresh DB
+    // has no modelscope models and the no-catalog-models notice is expected.
+    expect(body.modelsAvailable).toBe(0);
+  });
+
+  it('POST /api/keys rejects invalid platform', async () => {
+    const { status } = await request(app, 'POST', '/api/keys', {
+      platform: 'invalid_platform',
+      key: 'test',
+    });
+    expect(status).toBe(400);
+  });
+
+  it.each(['freeai', 'inferbase', 'simplellm', 'aclide', 'speka', 'electronhub', 'experiential', 'router9', 'septor', 'clod', 'speechify', 'blaze', 'lucidity', 'airforce', 'dreamprompting', 'waterfall', 'logfare'])('accepts a %s key without seeding gated model rows', async platform => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform, key: 'not-a-real-test-key-12345', label: 'Gateway test',
+    });
+    expect(status).toBe(201);
+    expect(body.platform).toBe(platform);
+    expect(body.modelsAvailable).toBe(0);
+    expect(getDb().prepare('SELECT COUNT(*) AS n FROM models WHERE platform = ?').get(platform)).toEqual({ n: 0 });
+  });
+
+  it('POST /api/keys rejects missing key', async () => {
+    const { status } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+    });
+    expect(status).toBe(400);
+  });
+
+  it('DELETE /api/keys/:id removes a key', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+
+    const { status } = await request(app, 'DELETE', `/api/keys/${created.id}`);
+    expect(status).toBe(200);
+
+    const { body: after } = await request(app, 'GET', '/api/keys');
+    expect(after).toHaveLength(0);
+  });
+
+  it('DELETE /api/keys/:id returns 404 for nonexistent key', async () => {
+    const { status } = await request(app, 'DELETE', '/api/keys/99999');
+    expect(status).toBe(404);
+  });
+
+  it('DELETE /api/keys/:id sweeps key-bound rows on standard platforms (#1516)', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+    const db = getDb();
+    // A key-bound chat row plus its fallback row, embedding row and media row.
+    // Shared catalog rows (key_id NULL) must survive the delete.
+    const chat = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, key_id, enabled, source)
+      VALUES ('groq', 'orphan-chat-1516', 'Orphan Chat', 50, 50, 'Large', ?, 1, 'user')
+    `).run(created.id);
+    db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 9999, 1)').run(chat.lastInsertRowid);
+    db.prepare(`
+      INSERT INTO embedding_models (family, platform, model_id, display_name, dimensions, priority, enabled, quota_label, key_id)
+      VALUES ('fam-1516', 'groq', 'orphan-embed-1516', 'Orphan Embed', 768, 1, 1, 'test', ?)
+    `).run(created.id);
+    db.prepare(`
+      INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label, key_id)
+      VALUES ('groq', 'orphan-tts-1516', 'Orphan TTS', 'audio', 1, 1, 'test', ?)
+    `).run(created.id);
+    const sharedBefore = (db.prepare("SELECT COUNT(*) AS n FROM models WHERE platform = 'groq' AND key_id IS NULL").get() as { n: number }).n;
+
+    const { status } = await request(app, 'DELETE', `/api/keys/${created.id}`);
+    expect(status).toBe(200);
+
+    expect(db.prepare('SELECT COUNT(*) AS n FROM models WHERE key_id = ?').get(created.id)).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM embedding_models WHERE key_id = ?').get(created.id)).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM media_models WHERE key_id = ?').get(created.id)).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM fallback_config WHERE model_db_id = ?').get(chat.lastInsertRowid)).toEqual({ n: 0 });
+    // Shared catalog rows are untouched.
+    expect(db.prepare("SELECT COUNT(*) AS n FROM models WHERE platform = 'groq' AND key_id IS NULL").get()).toEqual({ n: sharedBefore });
+  });
+
+  it('PATCH /api/keys/:id updates label', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+
+    const { status, body } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
+      label: 'Production key',
+    });
+
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.label).toBe('Production key');
+
+    const { body: keys } = await request(app, 'GET', '/api/keys');
+    expect(keys[0].label).toBe('Production key');
+  });
+
+  it('PATCH /api/keys/:id updates both enabled and label', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+
+    const { status, body } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
+      enabled: false,
+      label: 'Disabled key',
+    });
+
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.enabled).toBe(false);
+    expect(body.label).toBe('Disabled key');
+
+    const { body: keys } = await request(app, 'GET', '/api/keys');
+    expect(keys[0].enabled).toBe(false);
+    expect(keys[0].label).toBe('Disabled key');
+  });
+
+  it('PATCH /api/keys/:id replaces the credential without changing its stable identity', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_old_key_123456',
+      label: 'Before',
+    });
+    getDb().prepare(`
+      INSERT INTO rate_limit_cooldowns (platform, model_id, key_id, expires_at_ms)
+      VALUES ('groq', 'llama-3.3-70b', ?, ?)
+    `).run(created.id, Date.now() + 60_000);
+
+    const { status, body } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
+      key: 'gsk_new_key_654321',
+    });
+
+    expect(status).toBe(200);
+    expect(body.maskedKey).toContain('gsk_new_key_654321'.slice(-4));
+    const row = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(decrypt(row.encrypted_key, row.iv, row.auth_tag)).toBe('gsk_new_key_654321');
+    expect(row.platform).toBe('groq');
+    expect(row.label).toBe('Before');
+    expect(row.enabled).toBe(1);
+    expect(row.status).toBe('unknown');
+    expect(row.last_checked_at).toBeNull();
+    expect(row.last_health_error).toBeNull();
+    expect(getDb().prepare('SELECT COUNT(*) AS n FROM rate_limit_cooldowns WHERE key_id = ?')
+      .get(created.id)).toEqual({ n: 0 });
+  });
+
+  it('PATCH /api/keys/:id preserves a Cloudflare credential when a malformed replacement is submitted', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'cloudflare', key: 'old-account:old-token', label: 'Original',
+    });
+    for (const key of ['token-only', ':token', 'account:', 'account:   ']) {
+      const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, { key, label: 'Changed' });
+      expect(status).toBe(400);
+    }
+    const row = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(decrypt(row.encrypted_key, row.iv, row.auth_tag)).toBe('old-account:old-token');
+    expect(row.label).toBe('Original');
+    const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, { key: 'new-account:new-token' });
+    expect(status).toBe(200);
+    const updated = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(decrypt(updated.encrypted_key, updated.iv, updated.auth_tag)).toBe('new-account:new-token');
+  });
+
+  it('PATCH /api/keys/:id leaves health state alone when the submitted key is unchanged', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_same_key_123456',
+    });
+    getDb().prepare(`
+      UPDATE api_keys
+         SET status = 'healthy', last_checked_at = datetime('now'), last_health_error = NULL
+       WHERE id = ?
+    `).run(created.id);
+
+    const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
+      key: 'gsk_same_key_123456',
+    });
+
+    expect(status).toBe(200);
+    const row = getDb().prepare('SELECT status, last_checked_at FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(row.status).toBe('healthy');
+    expect(row.last_checked_at).toBeTruthy();
+  });
+
+  // #1331: key-optional providers (Kilo, OVH, AI Horde) accept a real key.
+  const storedKey = (id: number) => {
+    const row = getDb().prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(id) as any;
+    return decrypt(row.encrypted_key, row.iv, row.auth_tag);
+  };
+
+  it('PATCH /api/keys/:id stores a real credential on a key-optional provider', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', { platform: 'kilo', key: '' });
+    expect(storedKey(created.id)).toBe('no-key');
+
+    const { status, body } = await request(app, 'PATCH', `/api/keys/${created.id}`, { key: 'kilo-real-secret' });
+
+    expect(status).toBe(200);
+    expect(body.maskedKey).not.toContain('kilo-real-secret');
+    const row = getDb().prepare('SELECT encrypted_key, status FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(row.encrypted_key).not.toContain('kilo-real-secret');
+    expect(row.status).toBe('unknown');
+    expect(storedKey(created.id)).toBe('kilo-real-secret');
+  });
+
+  it.each(['kilo', 'ovh', 'aihorde', 'parallel'])('POST /api/keys without a key stores one anonymous %s row', async (platform) => {
+    const first = await request(app, 'POST', '/api/keys', { platform });
+    const second = await request(app, 'POST', '/api/keys', { platform, key: '   ' });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    expect(second.body.id).toBe(first.body.id);
+    expect(storedKey(first.body.id)).toBe('no-key');
+    const { body: keys } = await request(app, 'GET', '/api/keys');
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatchObject({ platform, keyless: true, keyOptional: true, exportable: false });
+  });
+
+  it.each(['kilo', 'ovh', 'aihorde', 'parallel'])('POST /api/keys stores a real %s key encrypted', async (platform) => {
+    const { status, body } = await request(app, 'POST', '/api/keys', { platform, key: ` ${platform}-secret-123 `, label: 'mine' });
+
+    expect(status).toBe(201);
+    expect(body.maskedKey).not.toContain(`${platform}-secret-123`);
+    expect(storedKey(body.id)).toBe(`${platform}-secret-123`);
+    const { body: keys } = await request(app, 'GET', '/api/keys');
+    expect(keys[0]).toMatchObject({ platform, label: 'mine', keyless: false, keyOptional: true, exportable: true });
+  });
+
+  it('POST /api/keys upgrades the anonymous row in place when a real key arrives', async () => {
+    const { body: anon } = await request(app, 'POST', '/api/keys', { platform: 'ovh' });
+    getDb().prepare("UPDATE api_keys SET status = 'healthy', enabled = 0 WHERE id = ?").run(anon.id);
+
+    const { status, body } = await request(app, 'POST', '/api/keys', { platform: 'ovh', key: 'ovh-token-abc', label: 'Work' });
+
+    expect(status).toBe(200);
+    expect(body.id).toBe(anon.id);
+    expect(storedKey(anon.id)).toBe('ovh-token-abc');
+    const row = getDb().prepare('SELECT label, status, enabled FROM api_keys WHERE id = ?').get(anon.id) as any;
+    expect(row).toEqual({ label: 'Work', status: 'unknown', enabled: 1 });
+    expect(getDb().prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'ovh'").get()).toEqual({ n: 1 });
+  });
+
+  it('POST /api/keys adds a second real key alongside an existing one on a key-optional provider', async () => {
+    const { body: a } = await request(app, 'POST', '/api/keys', { platform: 'aihorde', key: 'horde-a' });
+    const { status, body: b } = await request(app, 'POST', '/api/keys', { platform: 'aihorde', key: 'horde-b' });
+
+    expect(status).toBe(201);
+    expect(b.id).not.toBe(a.id);
+    expect(storedKey(a.id)).toBe('horde-a');
+    expect(storedKey(b.id)).toBe('horde-b');
+  });
+
+  it('PATCH /api/keys/:id clears label', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+      label: 'Temporary label',
+    });
+
+    const { status, body } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
+      label: '',
+    });
+
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.label).toBe('');
+
+    const { body: keys } = await request(app, 'GET', '/api/keys');
+    expect(keys[0].label).toBe('');
+  });
+
+  it('PATCH /api/keys/:id returns 400 when no fields provided', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+
+    const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, {});
+    expect(status).toBe(400);
+  });
+
+  it('PATCH /api/keys/:id returns 404 for nonexistent key', async () => {
+    const { status } = await request(app, 'PATCH', '/api/keys/99999', { label: 'test' });
+    expect(status).toBe(404);
+  });
+
+  describe('key import', () => {
+    it('previews keys from multiple supported files', async () => {
+      const { status, body } = await multipartRequest(app, '/api/keys/preview', 'files', [
+        { filename: 'keys.env', content: 'GROQ_API_KEY=gsk_test123\nANTHROPIC_API_KEY=sk-ant-test' },
+        { filename: 'more.jsonc', content: '{ // comment\n "MISTRAL_API_KEY": "mist_test456",\n}' },
+      ]);
+
+      expect(status).toBe(200);
+      expect(body.keys).toEqual([
+        { keyName: 'GROQ_API_KEY', keyValue: 'gsk_test123', detectedPlatform: 'groq', prefix: 'GROQ_', isDuplicate: false },
+        { keyName: 'ANTHROPIC_API_KEY', keyValue: 'sk-ant-test', detectedPlatform: null, prefix: 'ANTHROPIC_', isDuplicate: false },
+        { keyName: 'MISTRAL_API_KEY', keyValue: 'mist_test456', detectedPlatform: 'mistral', prefix: 'MISTRAL_', isDuplicate: false },
+      ]);
+      expect(body.total).toBe(3);
+      expect(body.duplicates).toBe(0);
+    });
+
+    it('imports selected preview rows', async () => {
+      const { status, body } = await request(app, 'POST', '/api/keys/import-selected', {
+        keys: [
+          { keyName: 'GROQ_API_KEY', keyValue: 'gsk_test123', platform: 'groq' },
+          { keyName: 'MISTRAL_API_KEY', keyValue: 'mist_test456', platform: 'mistral' },
+        ],
+      });
+
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ imported: 2, skipped: [], errors: [], total: 2 });
+
+      const { body: keys } = await request(app, 'GET', '/api/keys');
+      expect(keys.map((key: any) => key.platform).sort()).toEqual(['groq', 'mistral']);
+    });
+
+    it('auto-imports recognized keys from one file and skips unknown providers', async () => {
+      const { status, body } = await multipartRequest(app, '/api/keys/import', 'file', [
+        { filename: 'keys.env', content: 'GROQ_API_KEY=gsk_test123\nANTHROPIC_API_KEY=sk-ant-test' },
+      ]);
+
+      expect(status).toBe(200);
+      expect(body.imported).toBe(1);
+      expect(body.skipped).toContain('ANTHROPIC_API_KEY');
+
+      const { body: keys } = await request(app, 'GET', '/api/keys');
+      expect(keys).toHaveLength(1);
+      expect(keys[0].platform).toBe('groq');
+    });
+
+    it('rejects unsupported files and malformed JSON uploads', async () => {
+      const unsupported = await multipartRequest(app, '/api/keys/preview', 'files', [
+        { filename: 'keys.js', content: 'module.exports = {}' },
+      ]);
+      expect(unsupported.status).toBe(400);
+      expect(unsupported.body.error.message).toBe('Unsupported file type');
+
+      const malformed = await multipartRequest(app, '/api/keys/import', 'file', [
+        { filename: 'keys.json', content: '{bad json' },
+      ]);
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error.message).toBe('Invalid JSON format');
+    });
+  });
+
+  // #705: the dashboard only ever had the platform-wide switch, which for the
+  // Custom group meant every endpoint the operator runs. These are the two
+  // scopes it now offers, kept honest against each other.
+  describe('enable scope', () => {
+    async function addKey(platform: string, key: string) {
+      const { body } = await request(app, 'POST', '/api/keys', { platform, key });
+      return body.id as number;
+    }
+    const enabledById = async () => {
+      const { body } = await request(app, 'GET', '/api/keys');
+      return Object.fromEntries((body as any[]).map(k => [k.id, k.enabled]));
+    };
+
+    it('PATCH /api/keys/:id disables one key and leaves its siblings alone', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+
+      const { status } = await request(app, 'PATCH', `/api/keys/${first}`, { enabled: false });
+
+      expect(status).toBe(200);
+      expect(await enabledById()).toEqual({ [first]: false, [second]: true });
+    });
+
+    it('PATCH /api/keys/platform/:platform still writes every key of that platform', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+      const other = await addKey('cerebras', 'csk_other_key_789');
+
+      const { body } = await request(app, 'PATCH', '/api/keys/platform/groq', { enabled: false });
+
+      expect(body.updatedKeys).toBe(2);
+      expect(await enabledById()).toEqual({ [first]: false, [second]: false, [other]: true });
+    });
+
+    it('re-enables a single key of a platform that was switched off wholesale', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+      await request(app, 'PATCH', '/api/keys/platform/groq', { enabled: false });
+
+      await request(app, 'PATCH', `/api/keys/${second}`, { enabled: true });
+
+      expect(await enabledById()).toEqual({ [first]: false, [second]: true });
+    });
+
+    it('404s a key that does not exist', async () => {
+      const { status } = await request(app, 'PATCH', '/api/keys/99999', { enabled: false });
+      expect(status).toBe(404);
+    });
+  });
+});

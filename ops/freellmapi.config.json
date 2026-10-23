@@ -59,6 +59,12 @@
       "key": "REDACTED",
       "label": "main",
       "enabled": true
+    },
+    {
+      "platform": "cloudflare",
+      "key": "REDACTED",
+      "label": "workers-ai",
+      "enabled": true
     }
   ],
   "routing": {

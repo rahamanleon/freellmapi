@@ -74,6 +74,7 @@ ops/                            operations toolkit and documentation
 | --- | --- |
 | `ops/freellmapi.config.json` | dashboard admin password + provider API keys |
 | `ops/secrets/encryption-key.txt` | `ENCRYPTION_KEY` (also the database backup key) |
+| `ops/secrets/unified-api-key.txt` | the live gateway key every client authenticates with (`Authorization: Bearer freellmapi-...`) |
 | `ops/secrets/dashboard-password.txt` | dashboard password |
 | `freellmapi/.env` | `ENCRYPTION_KEY` as the gateway reads it at runtime |
 

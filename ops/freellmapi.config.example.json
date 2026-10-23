@@ -24,6 +24,12 @@
       "platform": "aihorde",
       "label": "keyless",
       "enabled": true
+    },
+    {
+      "platform": "cloudflare",
+      "key": "REPLACE_WITH_ACCOUNT_ID:REPLACE_WITH_WORKERS_AI_TOKEN",
+      "label": "image",
+      "enabled": false
     }
   ],
   "routing": {

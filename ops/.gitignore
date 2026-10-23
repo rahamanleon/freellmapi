@@ -5,3 +5,4 @@
 # This file therefore only filters local scratch output.
 *.out
 *.err
+out/

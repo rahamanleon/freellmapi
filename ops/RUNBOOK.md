@@ -88,7 +88,10 @@ Durin Agent\                        <- this directory is the Git repository
       db-inspect.mjs               read-only DB report; redacts + fingerprints secrets
       list-models.mjs              what the gateway exposes on GET /v1/models
       verify-router.mjs            end-to-end chat completion probe (+ tool-calling mode)
+      verify-images.mjs            image-generation probe; explains what is missing
       validate-config.mjs          preflight the config against the real upstream loader
+      add-key.mjs                  add/update one provider key: validate, apply, publish
+      publish-config.mjs           rebuild secrets\config-oneline.json for Render
       test-backup-restore.ps1      wipe-and-restore durability proof
 ```
 
@@ -151,6 +154,12 @@ POST /api/settings/api-key/regenerate      (Bearer token)     -> { apiKey }
 The credential the agent uses is that unified key, sent as
 `Authorization: Bearer freellmapi-...` against `<base-url>/v1/chat/completions`
 (or `<base-url>/v1/messages` for the Anthropic shape, or `/v1/embeddings`).
+
+The key currently in use on the deployed gateway is recorded in
+`ops\secrets\unified-api-key.txt`. A local install mints its **own** key on
+first boot, so the two match only when the local database was restored from the
+production backup - a key from one instance answers `401` on the other. The
+deployed key is the one clients (including the Durin Agent) must use.
 
 **This is exactly why the backup matters.** If the database is ever wiped
 without a restore, `regenerateUnifiedKey()` state is lost and a *new* key is
@@ -241,15 +250,24 @@ values and bad enums. Your live database is never touched.
 
 ### 5.1 What is configured now
 
-| Platform | Credential | Tool calling | Notes |
-| --- | --- | --- | --- |
-| `openrouter` | API key | yes (verified) | free tier is ~20 req/min and **~50 requests/day** without a one-time $10 top-up |
-| `kilo` | **none (keyless)** | not yet exercised | 200 req/hr per IP; free prompts/outputs are logged for training |
-| `ovh` | **none (keyless)** | yes (verified) | 2 req/min per model per IP |
-| `aihorde` | **none (keyless)** | **no** | volunteer workers, queue-based, slow; text only |
+`ops/freellmapi.config.json` is the authoritative list; this table is a summary
+of what each entry is for.
 
-`kilo`, `ovh` and `aihorde` are registered upstream as keyless: omit the `key`
-field entirely and the server stores a sentinel row. This gives real
+| Platform | Credential | Notes |
+| --- | --- | --- |
+| `openrouter` | API key | tool calling verified; ~50 requests/day without a one-time $10 top-up |
+| `kilo` | **none (keyless)** | 200 verified; 200 req/hr per IP |
+| `ovh` | **none (keyless)** | tool calling verified; 2 req/min per model per IP |
+| `aihorde` | **none (keyless)** | **no tool calling** by design (queue-based, text only) |
+| `google` | API key | Gemini free tier; also serves Gemini TTS and (when catalogued) Imagen |
+| `groq` | API key | free tier; also the STT provider (Whisper) |
+| `parallel` | **none (keyless)** | web search only - contributes no chat models |
+| `zhipu` | API key | GLM free tier |
+| `mistral` | API key | La Plateforme free tier |
+| `nvidia` | API key | NIM chat; the FLUX image adapter exists in the code, but the free catalog ships no `nvidia` image rows |
+
+`kilo`, `ovh`, `aihorde` and `parallel` are registered upstream as keyless: omit
+the `key` field entirely and the server stores a sentinel row. This gives real
 multi-provider redundancy with **zero** additional sign-ups.
 
 ### 5.2 Additional no-card providers (research result, 2026-10)
@@ -284,6 +302,95 @@ direct fix.
 The platform name must match upstream's registry exactly (it is validated
 against the real registry, so a typo fails the preflight rather than silently
 disabling a provider).
+
+### 5.4 Image generation (media providers)
+
+`POST /v1/images/generations` is a **separate router** from chat: image models
+live in their own `media_models` table, so a chat request can never be routed to
+an image model. Request and response are OpenAI-shaped:
+
+```bash
+curl https://<service>.onrender.com/v1/images/generations \
+  -H "Authorization: Bearer $FREELMAPI_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","prompt":"a ripe mango on a wooden table","n":1,"size":"1024x1024"}'
+```
+
+`model` is either `auto` (failover across every enabled image row in catalog
+priority order) or a provider model id such as
+`@cf/black-forest-labs/flux-1-schnell`. The response is
+`{ created, data: [{ b64_json } | { url }], model, provider }` - `provider`
+tells you which platform actually produced it.
+
+#### Which platforms can serve an image
+
+The adapter allowlist is `MEDIA_PLATFORMS` in
+`freellmapi/server/src/services/media.ts`. Being on that list is necessary but
+not sufficient: catalog-sync only creates rows for platforms the signed catalog
+lists, and a row with no usable key is skipped at request time.
+
+| Platform | Adapter | Rows in the free catalog (v2026.10.23) | Credential |
+| --- | --- | --- | --- |
+| `cloudflare` | yes (JSON + multipart) | **9 models** | `account_id:API_token` |
+| `nvidia` | yes (NIM `genai` schema) | none | `nvapi-...` (already configured) |
+| `google` | yes (Imagen `:predict`) | none | Gemini API key (already configured) |
+| `siliconflow` | yes (OpenAI-shaped) | none | API key |
+| `pollinations` | yes (anonymous GET) | none | now requires a key |
+| `custom` | yes (any OpenAI-compatible `/images/generations`) | n/a | base URL + key, registered from the dashboard |
+| `agnes` | **no adapter on this pin** | 2 promo rows | - |
+
+Four consequences, stated plainly:
+
+- **Cloudflare is the only config-only path today.** It is the only platform
+  that has both an adapter and rows in the free catalog.
+- **`agnes-image-2.0-flash` / `agnes-image-2.1-flash` cannot be served.** The
+  rows are in the catalog, but `MEDIA_PLATFORMS` has no `agnes` entry, so
+  catalog-sync drops them. Upstream `v0.16.9` does not add one either, so
+  upgrading the pin will not fix it.
+- **The nvidia key does not light up image generation.** The FLUX adapter is
+  present in `v0.16.3`, but the free catalog lists no `nvidia` image models.
+- The uncommitted `google` Imagen hunk in the local checkout is not in the
+  deployed image (Render pulls the pinned GHCR image, not a source build), and
+  no Imagen rows exist in the free catalog, so enabling it would change nothing.
+
+#### Adding Cloudflare Workers AI (free: ~10k neurons/day, no card)
+
+1. Cloudflare dashboard -> **Workers & Pages** -> copy the **Account ID**
+   (32 hex characters).
+2. **My Profile -> API Tokens -> Create Token**, permission **Workers AI: Read**.
+   Nothing else is needed (the "Workers AI" template token works).
+3. Store it as one entry - the adapter splits on the **first** colon:
+
+   ```powershell
+   node ops\scripts\add-key.mjs cloudflare "<account_id>:<API_token>"
+   ```
+
+   The script validates the candidate against the real upstream loader, swaps it
+   in only if it passes, and then rewrites `ops\secrets\config-oneline.json`.
+
+4. Put the new config on the running service. It is read **at boot only**:
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File ops\scripts\copy-for-render.ps1 -Which config
+   ```
+   Paste into `FREEAPI_CONFIG_JSON`, then redeploy. Locally: restart the server.
+
+5. Prove it:
+
+   ```powershell
+   node ops\scripts\verify-images.mjs --inspect                      # rows + key status, no network
+   node ops\scripts\verify-images.mjs http://127.0.0.1:3001 auto    # real generation
+   ```
+   The probe decodes the response and writes it to `ops\out\images\`.
+
+`size` maps to width/height (`1024x1024`, `1024x1792`, ...) and `n` is capped at
+4 by the route. `@cf/black-forest-labs/flux-1-schnell` is prompt-only and
+ignores size; the SDXL, FLUX.2 and Leonardo rows accept width and height.
+
+Anything that is **not** OpenAI-compatible needs a new adapter in `media.ts`
+plus a `MEDIA_PLATFORMS` entry - i.e. a fork and a source build. `custom`
+endpoints are the no-code escape hatch for services that do speak
+`/images/generations`.
 
 ---
 
@@ -327,15 +434,19 @@ image - no fork, no build.
 
 ### Building the `FREEAPI_CONFIG_JSON` value
 
-It must be a **single line**. From PowerShell:
+It must be a **single line**, and it is easy to publish the wrong one. Use the
+script, which validates first and writes the exact copy that
+`copy-for-render.ps1` reads:
 
 ```powershell
 cd "C:\Users\Leon\Desktop\Durin Agent"
-(Get-Content ops\freellmapi.config.json -Raw) -replace "`r?`n", " " -replace "\s+", " "
+node ops\scripts\publish-config.mjs
+powershell -NoProfile -ExecutionPolicy Bypass -File ops\scripts\copy-for-render.ps1 -Which config
 ```
 
-Copy the printed single line into the Render field. Validate it first with
-`validate-config.mjs` so you are not debugging JSON in a deploy log.
+Then paste into the Render field. `node ops\scripts\publish-config.mjs --check`
+exits non-zero when `ops\secrets\config-oneline.json` has drifted from the real
+config - the failure mode that silently dropped the nvidia key from a deploy.
 
 ### Why the values in `render.yaml` are what they are
 
@@ -502,6 +613,12 @@ FreeLLMAPI is not involved here. The agent talks to Atlas directly.
 | Client suddenly gets 401 after a Render restart | The database was wiped and a new unified key was generated | Check the backup config; the key only survives if the backup restored |
 | `npm` exits 1 in PowerShell | npm writes warnings to stderr and PS 5.1 treats that as a native command error | Read the summary text, not the exit code |
 | `ERROR: The system was unable to find the specified registry key or value.` at boot (Windows) | Benign. `lib/proxy.ts` reads the Internet Options registry (`ProxyEnable` / `ProxyServer`) to detect a system proxy; on a machine with none configured the key is absent | Ignore. It is followed by `[proxy] Not configured - outbound requests go direct.` and does not appear on Linux/Render |
+| `POST /v1/images/generations` -> `503 No enabled image providers configured` | The database has no image rows yet | Boot once and let catalog-sync land (or trigger a sync in the dashboard), then `node ops\scripts\verify-images.mjs --inspect` |
+| `503 All image providers failed ... (no usable keys)` | Rows exist, but that platform has no enabled + healthy key | `node ops\scripts\add-key.mjs cloudflare "<account_id>:<API_token>"`, then restart (section 5.4) |
+| `400 Unknown image model 'X'` | Not an enabled image row on this install | Use `auto`, or an id printed by `verify-images.mjs --inspect` |
+| `401`/`403` from `cloudflare` on an image request | Token lacks **Workers AI: Read**, or the account id is wrong | Recreate the token; the stored key is `account_id:API_token` |
+| `404` from `cloudflare` for one image model | That Workers AI model is not enabled for the account | Use another row - `auto` fails over |
+| Image request returns `url` instead of `b64_json` | Normal for `siliconflow` and some custom endpoints | `verify-images.mjs` downloads it; an OpenAI SDK does the same |
 
 ---
 
@@ -514,3 +631,8 @@ FreeLLMAPI is not involved here. The agent talks to Atlas directly.
 4. **Render** - push this repository and apply `render.yaml`, supplying the four secrets.
 5. **First-deploy check** - confirm the backup file appears in the dataset repo,
    then restart the service and confirm `[db-backup] restored ... bytes`.
+6. **Image generation** - free image models are catalogued but unusable until a
+   provider key exists. Cloudflare Workers AI is the only config-only path
+   (10k neurons/day, no card): create the token, then
+   `node ops\scripts\add-key.mjs cloudflare "<account_id>:<token>"` and
+   republish the config (section 5.4).

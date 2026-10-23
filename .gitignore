@@ -44,3 +44,23 @@ freellmapi/.git/
 # Written by the add-a-key workflow before every edit. They duplicate every
 # secret in the repo, so they are never committed.
 ops/secrets/*.bak-*
+
+# ---- backup receiver secrets: NEVER committed, unlike the rest ------------
+# The repo's stance above is that live credentials live here on purpose. The
+# backup receiver is the deliberate exception. Its secrets are a MongoDB
+# Atlas URI (which carries the database password) and the bearer token that
+# guards the gateway's only durable copy of its own database. Neither belongs
+# in Git history: rotating a leaked Atlas password is easy, but a leaked
+# bearer token silently grants read AND overwrite access to backups, and an
+# overwrite is exactly the failure mode this receiver exists to prevent.
+# Set them on the host instead: `wrangler secret put MONGODB_URI` /
+# `wrangler secret put BACKUP_TOKEN` for the Worker, environment variables for
+# the Node entry.
+ops/backup-receiver/.env
+ops/backup-receiver/.env.*
+ops/backup-receiver/.dev.vars
+ops/backup-receiver/.dev.vars.*
+ops/backup-receiver/local.env
+# wrangler's build cache and any local deploy state
+ops/backup-receiver/.wrangler/
+ops/backup-receiver/dist/

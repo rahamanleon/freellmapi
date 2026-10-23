@@ -1,0 +1,23 @@
+{
+  "name": "freellmapi-backup-receiver",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MongoDB-backed storage endpoint for FreeLLMAPI's encrypted SQLite backup pump",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node src/node.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "mongodb": "^6.16.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}

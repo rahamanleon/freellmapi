@@ -1,0 +1,31 @@
+# Cloudflare Worker configuration for the FreeLLMAPI backup receiver.
+#
+# NO SECRETS IN THIS FILE. MONGODB_URI and BACKUP_TOKEN are set with:
+#   npx wrangler secret put MONGODB_URI
+#   npx wrangler secret put BACKUP_TOKEN
+#
+# The BACKUP_TOKEN value MUST be the same string set as FREEAPI_DB_BACKUP_TOKEN
+# in the gateway's environment, or every request is answered 401.
+
+name = "freellmapi-backup-receiver"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+
+# Required for the MongoDB Node driver: it needs node:net + node:tls, which
+# shipped in workerd in Jan 2025 (cf/workerd#3340, #3594). Without this the
+# driver imports but cannot open a socket.
+compatibility_flags = ["nodejs_compat"]
+
+# Free plan: 100,000 requests/day, 10 ms CPU/invocation, 128 MB memory.
+# Our steady-state load is 96 PUTs/day (15-minute pump) plus restore GETs, so
+# requests are far from the ceiling. The 10 ms CPU budget is the real
+# constraint and is measured by ops/scripts/verify-backup-receiver.mjs.
+#
+# Non-secret, deployment-shape settings live here rather than in secrets so
+# that a config change is visible in review:
+[vars]
+BACKUP_PATH = "/backup.bin"
+MONGODB_DB = "freellmapi_backup"
+MONGODB_COLLECTION = "revisions"
+BACKUP_RETENTION = "5"
+BACKUP_MAX_BYTES = "12582912"

@@ -270,6 +270,18 @@ function parseSize(size?: string): [number, number] {
   return [1024, 1024];
 }
 
+/** Map an OpenAI-style size (e.g. "1024x1024", "1792x1024", "1024x1792") to a
+ *  Google Imagen aspect ratio ("1:1", "16:9", "9:16"). Anything unparseable
+ *  falls back to square. */
+function sizeToAspectRatio(size?: string): string {
+  if (!size) return '1:1';
+  const m = /^(\d+)x(\d+)$/.exec(size);
+  if (!m) return '1:1';
+  const w = Number(m[1]), h = Number(m[2]);
+  if (w === h) return '1:1';
+  return w > h ? '16:9' : '9:16';
+}
+
 function parseCfKey(key: string | null): { accountId: string; token: string } {
   if (!key) throw new MediaError('cloudflare key required (account_id:token)', 401);
   const sep = key.indexOf(':');
@@ -454,6 +466,27 @@ async function callImageProvider(
       });
       const j = (await r.json()) as { images?: { url?: string }[]; data?: { url?: string }[] };
       return (j.images ?? j.data ?? []).map(i => ({ url: i.url }));
+    }
+    case 'google': {
+      // Google Imagen via the Generative Language API:
+      // POST https://generativelanguage.googleapis.com/v1beta/models/{model}:predict
+      // Auth: x-goog-api-key header. Body { instances: [{ prompt }], parameters: { sampleCount, aspectRatio } }.
+      // Response { predictions: [{ bytesBase64Encoded }] }.
+      const r = await mediaFetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${row.model_id}:predict`,
+        'google',
+        'image',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key ?? '' },
+          body: JSON.stringify({
+            instances: [{ prompt: p.prompt }],
+            parameters: { sampleCount: p.n ?? 1, aspectRatio: sizeToAspectRatio(p.size) },
+          }),
+        },
+      );
+      const j = (await r.json()) as { predictions?: { bytesBase64Encoded?: string }[] };
+      return (j.predictions ?? []).map(p => ({ b64_json: p.bytesBase64Encoded }));
     }
     default:
       throw new MediaError(`no image adapter for platform '${row.platform}'`, 500);
